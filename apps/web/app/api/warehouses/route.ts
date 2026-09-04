@@ -4,7 +4,7 @@ import { apiHandler } from "@/lib/api-response";
 import { requireTenantContext, requirePermission } from "@/lib/guard";
 import { listWarehouses, createWarehouse } from "@/lib/use-cases/warehouse";
 
-export async function GET(_req?: NextRequest) {
+export async function GET(_req: NextRequest) {
   return apiHandler(async () => {
     const ctx = await requireTenantContext();
     await requirePermission(ctx, "catalog.manage");

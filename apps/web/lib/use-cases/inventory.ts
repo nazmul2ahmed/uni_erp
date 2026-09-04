@@ -1,5 +1,5 @@
 import { and, eq, desc } from "drizzle-orm";
-import { stockBalances, stockMovements, warehouses, items, withTenantTransaction } from "@erp/db";
+import { stockBalances, stockMovements, stockBatches, warehouses, items, withTenantTransaction } from "@erp/db";
 import { AppError } from "@erp/shared";
 import type { TenantContext } from "../guard";
 
@@ -50,5 +50,22 @@ export async function getStockBalanceByItem(ctx: TenantContext, itemId: string, 
     const row = await tx.query.stockBalances.findFirst({ where });
     if (!row) throw new AppError("RESOURCE_NOT_FOUND", "No stock balance found");
     return row;
+  });
+}
+
+export async function getStockSummary(ctx: TenantContext, itemId: string) {
+  return withTenantTransaction(ctx.tenantId, async (tx) => {
+    const item = await tx.query.items.findFirst({ where: and(eq(items.id, itemId), eq(items.tenantId, ctx.tenantId), eq(items.isActive, true)) });
+    if (!item) throw new AppError("RESOURCE_NOT_FOUND", "Item not found");
+    const [balances, batches] = await Promise.all([
+      tx.query.stockBalances.findMany({ where: and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, itemId)) }),
+      tx.query.stockBatches.findMany({ where: and(eq(stockBatches.tenantId, ctx.tenantId), eq(stockBatches.itemId, itemId)) }),
+    ]);
+    return {
+      onHand: balances.reduce((sum, row) => sum + Number(row.quantityOnHand), 0),
+      reserved: balances.reduce((sum, row) => sum + Number(row.quantityReserved), 0),
+      byWarehouse: balances.map((row) => ({ warehouseId: row.warehouseId, batchId: row.batchId, onHand: row.quantityOnHand, reserved: row.quantityReserved })),
+      byBatch: batches.map((batch) => ({ id: batch.id, batchNumber: batch.batchNumber, expiryDate: batch.expiryDate, balances: balances.filter((row) => row.batchId === batch.id).map((row) => ({ warehouseId: row.warehouseId, onHand: row.quantityOnHand, reserved: row.quantityReserved })) })),
+    };
   });
 }
