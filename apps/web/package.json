@@ -14,22 +14,23 @@
     "@erp/db": "workspace:*",
     "@erp/shared": "workspace:*",
     "@erp/validation": "workspace:*",
+    "argon2": "^0.40.3",
+    "drizzle-orm": "^0.33.0",
+    "lucide-react": "^1.40.0",
     "next": "^14.2.5",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "argon2": "^0.40.3",
-    "zod": "^3.23.8",
-    "drizzle-orm": "^0.33.0"
+    "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.3",
-    "typescript": "^5.5.4",
-    "tailwindcss": "^3.4.7",
-    "postcss": "^8.4.40",
     "autoprefixer": "^10.4.19",
-    "vitest": "^2.0.5",
     "eslint": "^8.57.0",
-    "eslint-config-next": "^14.2.5"
+    "eslint-config-next": "^14.2.5",
+    "postcss": "^8.4.40",
+    "tailwindcss": "^3.4.7",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
   }
 }
