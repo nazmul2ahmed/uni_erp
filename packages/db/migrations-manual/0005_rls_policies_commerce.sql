@@ -86,6 +86,21 @@ DROP POLICY IF EXISTS tenant_isolation_stock_movements ON core.stock_movements;
 CREATE POLICY tenant_isolation_stock_movements ON core.stock_movements
   USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
 
+ALTER TABLE core.returns ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_returns ON core.returns;
+CREATE POLICY tenant_isolation_returns ON core.returns
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+ALTER TABLE core.return_lines ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_return_lines ON core.return_lines;
+CREATE POLICY tenant_isolation_return_lines ON core.return_lines
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
+ALTER TABLE core.stock_adjustments ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS tenant_isolation_stock_adjustments ON core.stock_adjustments;
+CREATE POLICY tenant_isolation_stock_adjustments ON core.stock_adjustments
+  USING (tenant_id = current_setting('app.tenant_id', true)::uuid);
+
 ALTER TABLE core.stock_balances ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS tenant_isolation_stock_balances ON core.stock_balances;
 CREATE POLICY tenant_isolation_stock_balances ON core.stock_balances

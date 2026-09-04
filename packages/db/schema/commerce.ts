@@ -350,6 +350,80 @@ export const saleItems = core.table(
 );
 
 /* ================================================================ */
+/* Returns / Adjustments — per 07 §9.4 and §12                       */
+/* ================================================================ */
+
+export const returns = core.table(
+  "returns",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    type: text("type", { enum: ["CUSTOMER_RETURN", "SUPPLIER_RETURN"] }).notNull(),
+    saleId: uuid("sale_id").references(() => sales.id),
+    purchaseId: uuid("purchase_id").references(() => purchases.id),
+    partyId: uuid("party_id").notNull(),
+    warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
+    status: text("status", { enum: ["COMPLETED", "CANCELLED"] }).notNull().default("COMPLETED"),
+    subtotal: numeric("subtotal", { precision: 18, scale: 4 }).notNull(),
+    grandTotal: numeric("grand_total", { precision: 18, scale: 4 }).notNull(),
+    returnDate: timestamp("return_date", { withTimezone: true }).notNull().defaultNow(),
+    operationId: uuid("operation_id").notNull(),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id),
+  },
+  (t) => ({
+    tenantOperationUnique: uniqueIndex("returns_tenant_operation_unique").on(t.tenantId, t.operationId),
+    tenantDateIdx: index("returns_tenant_date_idx").on(t.tenantId, t.returnDate),
+    tenantSaleIdx: index("returns_tenant_sale_idx").on(t.tenantId, t.saleId),
+    tenantPurchaseIdx: index("returns_tenant_purchase_idx").on(t.tenantId, t.purchaseId),
+  }),
+);
+
+export const returnLines = core.table(
+  "return_lines",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    returnId: uuid("return_id").notNull().references(() => returns.id, { onDelete: "cascade" }),
+    saleItemId: uuid("sale_item_id").references(() => saleItems.id),
+    purchaseItemId: uuid("purchase_item_id").references(() => purchaseItems.id),
+    itemId: uuid("item_id").notNull().references(() => items.id),
+    warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
+    batchId: uuid("batch_id").references(() => stockBatches.id),
+    quantity: numeric("quantity", { precision: 18, scale: 4 }).notNull(),
+    unitPrice: numeric("unit_price", { precision: 18, scale: 4 }).notNull(),
+    lineTotal: numeric("line_total", { precision: 18, scale: 4 }).notNull(),
+  },
+  (t) => ({
+    tenantReturnIdx: index("return_lines_tenant_return_idx").on(t.tenantId, t.returnId),
+  }),
+);
+
+export const stockAdjustments = core.table(
+  "stock_adjustments",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    itemId: uuid("item_id").notNull().references(() => items.id),
+    warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
+    batchId: uuid("batch_id").references(() => stockBatches.id),
+    quantityDelta: numeric("quantity_delta", { precision: 18, scale: 4 }).notNull(),
+    previousQuantity: numeric("previous_quantity", { precision: 18, scale: 4 }).notNull(),
+    resultingQuantity: numeric("resulting_quantity", { precision: 18, scale: 4 }).notNull(),
+    reason: text("reason").notNull(),
+    reference: text("reference"),
+    operationId: uuid("operation_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id),
+  },
+  (t) => ({
+    tenantOperationUnique: uniqueIndex("stock_adjustments_tenant_operation_unique").on(t.tenantId, t.operationId),
+    tenantDateIdx: index("stock_adjustments_tenant_date_idx").on(t.tenantId, t.createdAt),
+  }),
+);
+
+/* ================================================================ */
 /* Inventory Domain (movements/balances) — per 06 v2.0 §5.10             */
 /* ================================================================ */
 

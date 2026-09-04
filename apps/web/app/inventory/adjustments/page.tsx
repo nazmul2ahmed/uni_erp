@@ -1,0 +1,20 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+type Option = { id: string; name: string; code?: string };
+type Adjustment = { id: string; itemId: string; warehouseId: string; quantityDelta: string; resultingQuantity: string; reason: string; createdAt: string };
+
+async function api<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init); const body = await response.json();
+  if (!response.ok || !body.success) throw new Error(body.error?.message || "Unable to complete request");
+  return body.data as T;
+}
+
+export default function AdjustmentsPage() {
+  const [items, setItems] = useState<Option[]>([]); const [warehouses, setWarehouses] = useState<Option[]>([]); const [rows, setRows] = useState<Adjustment[]>([]); const [itemId, setItemId] = useState(""); const [warehouseId, setWarehouseId] = useState(""); const [quantityDelta, setQuantityDelta] = useState(""); const [reason, setReason] = useState(""); const [error, setError] = useState<string | null>(null); const [busy, setBusy] = useState(false);
+  const load = async () => { const [itemRows, warehouseRows, adjustmentRows] = await Promise.all([api<Option[]>("/api/items"), api<Option[]>("/api/warehouses"), api<Adjustment[]>("/api/inventory/adjustments")]); setItems(itemRows); setWarehouses(warehouseRows); setRows(adjustmentRows); };
+  useEffect(() => { void load().catch((err) => setError(err instanceof Error ? err.message : "Unable to load adjustments")); }, []);
+  const submit = async (event: React.FormEvent) => { event.preventDefault(); setBusy(true); setError(null); try { await api("/api/inventory/adjustments", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": crypto.randomUUID() }, body: JSON.stringify({ itemId, warehouseId, quantityDelta, reason }) }); setQuantityDelta(""); setReason(""); await load(); } catch (err) { setError(err instanceof Error ? err.message : "Unable to create adjustment"); } finally { setBusy(false); } };
+  return <main className="page-content"><header className="business-header"><div><p className="eyebrow">INVENTORY CONTROL</p><h1>Stock adjustments</h1><p className="page-description">Post an auditable quantity variance through the inventory ledger.</p></div></header><form className="form-section" onSubmit={submit}><div className="form-grid"><label>Item<select required value={itemId} onChange={(event) => setItemId(event.target.value)}><option value="">Select item</option>{items.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label>Warehouse<select required value={warehouseId} onChange={(event) => setWarehouseId(event.target.value)}><option value="">Select warehouse</option>{warehouses.map((warehouse) => <option value={warehouse.id} key={warehouse.id}>{warehouse.name}</option>)}</select></label><label>Quantity delta<input required inputMode="decimal" value={quantityDelta} onChange={(event) => setQuantityDelta(event.target.value)} placeholder="e.g. -2 or 5" /></label><label>Reason<input required value={reason} onChange={(event) => setReason(event.target.value)} placeholder="Physical count correction" /></label></div>{error && <p className="form-error" role="alert">{error}</p>}<button className="button button-primary" disabled={busy}>{busy ? "Posting..." : "Post adjustment"}</button></form><section className="table-panel"><h2>Adjustment history</h2>{rows.length === 0 ? <div className="inline-empty"><strong>No adjustments posted</strong><p>Posted variances will remain available for reconciliation.</p></div> : <div className="table-scroll"><table><thead><tr><th>Date</th><th>Item</th><th>Warehouse</th><th>Delta</th><th>Result</th><th>Reason</th></tr></thead><tbody>{rows.map((row) => <tr key={row.id}><td>{new Date(row.createdAt).toLocaleDateString()}</td><td>{row.itemId}</td><td>{row.warehouseId}</td><td>{row.quantityDelta}</td><td>{row.resultingQuantity}</td><td>{row.reason}</td></tr>)}</tbody></table></div>}</section></main>;
+}

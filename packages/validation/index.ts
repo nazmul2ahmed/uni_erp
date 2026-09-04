@@ -6,3 +6,4 @@ export * from "./item";
 export * from "./sale";
 export * from "./purchase";
 export * from "./payment";
+export * from "./return";

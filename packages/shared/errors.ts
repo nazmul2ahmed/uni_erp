@@ -13,6 +13,8 @@ export const ERROR_STATUS = {
   USER_NOT_FOUND: 404,
   MEMBERSHIP_NOT_FOUND: 404,
   RESOURCE_NOT_FOUND: 404,
+  RETURN_QTY_EXCEEDED: 409,
+  INSUFFICIENT_STOCK: 409,
   // Generic conditional-uniqueness violation (Postgres 23505 on a
   // partial unique index), per 06 v2.0 §5.4-§5.6's phone/sku
   // conditional UNIQUE constraints. Introduced in Phase 2 (Customer/
