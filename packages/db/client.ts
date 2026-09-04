@@ -2,20 +2,30 @@
  * Database client + tenant-scoped transaction helper.
  *
  * Implements RULE-POOL-001/002 (05 §25, Decision TEN-002):
- *   `SET LOCAL app.tenant_id` MUST be the first statement inside
- *   every tenant-scoped transaction, on the SAME transaction as
- *   every subsequent tenant-scoped query. This makes the pattern
+ *   Setting `app.tenant_id` (via `set_config('app.tenant_id', ..., true)`
+ *   — the `true` third argument is `is_local`, i.e. LOCAL-transaction
+ *   scope, equivalent to `SET LOCAL`) MUST be the first statement
+ *   inside every tenant-scoped transaction, on the SAME transaction
+ *   as every subsequent tenant-scoped query. This makes the pattern
  *   safe under PgBouncer transaction-mode pooling.
  *
- * NEVER use `SET SESSION` — it survives connection-pool handback
- * and can leak tenant context across tenants (05 §160-161).
+ * NEVER use `SET SESSION` / `set_config(..., false)` — it survives
+ * connection-pool handback and can leak tenant context across
+ * tenants (05 §160-161).
+ *
+ * NOTE: `set_config()` (a function call), not the bare `SET LOCAL ...`
+ * statement, is used below — PostgreSQL's `SET`/`SET LOCAL` commands
+ * do not accept bind parameters for their value, only `set_config()`
+ * does (see `sql_setLocal`'s docblock for the concrete defect this
+ * form was introduced to fix).
  */
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 import * as controlSchema from "./schema/control";
 import * as coreSchema from "./schema/core";
+import * as commerceSchema from "./schema/commerce";
 
-const schema = { ...controlSchema, ...coreSchema };
+const schema = { ...controlSchema, ...coreSchema, ...commerceSchema };
 
 // Runtime application connections use the non-superuser, non-owner
 // erp_app role (RLS Role Architecture Decision) — NOT the migration/
@@ -53,13 +63,36 @@ export async function withTenantTransaction<T>(
   });
 }
 
-// Small helper kept separate so the SET LOCAL statement is visually
-// distinct/greppable in code review (13 §9.2 checklist item: "no raw
-// SQL string concatenation of user input" — tenantId here is a
+// Small helper kept separate so the tenant-scoping statement is
+// visually distinct/greppable in code review (13 §9.2 checklist item:
+// "no raw SQL string concatenation of user input" — tenantId here is a
 // validated UUID from TenantContext, not raw user input).
+//
+// BUGFIX (Phase 2 discovery, tenant-isolation integration test suite):
+// `SET LOCAL app.tenant_id = ${tenantId}` — using the bare `SET`
+// statement with an interpolated value — is INVALID PostgreSQL syntax
+// once drizzle's `sql` tag (correctly, per parameterized-query
+// discipline, 13 §4.2) binds `${tenantId}` as a `$1` placeholder
+// rather than inlining it as a literal. PostgreSQL's `SET`/`SET LOCAL`
+// commands do not accept bind parameters for their value — only a
+// literal or a function call does. This was UNDETECTED until now
+// because every prior manual/build verification (typecheck, lint,
+// `next build`) only proves the TypeScript/SQL-template compiles; it
+// never executes against a live database. The one existing test that
+// DOES hit a live database (packages/db/test/rls.test.ts) happened to
+// already use the correct form (`SELECT set_config('app.tenant_id',
+// $1, true)`, a plain function call, which DOES accept bind
+// parameters) — so this defect was invisible until a second, actually
+// end-to-end test path (apps/web/test/tenant-isolation.integration.test.ts)
+// exercised `withTenantTransaction` itself for the first time. Fixed
+// here to the same `set_config()` form rls.test.ts already used
+// correctly — this changes ONLY the SQL dialect used to set the
+// session variable; the transaction-scoping discipline (05 §25,
+// Decision TEN-002) itself is unchanged.
 import { sql } from "drizzle-orm";
+
 function sql_setLocal(tenantId: string) {
-  return sql`SET LOCAL app.tenant_id = ${tenantId}`;
+  return sql`SELECT set_config('app.tenant_id', ${tenantId}, true)`;
 }
 
 /**
@@ -76,3 +109,4 @@ export async function withPlatformTransaction<T>(
 export { schema };
 export * from "./schema/control";
 export * from "./schema/core";
+export * from "./schema/commerce";

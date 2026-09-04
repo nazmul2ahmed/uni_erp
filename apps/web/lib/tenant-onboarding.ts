@@ -46,9 +46,16 @@ export async function registerOwnerAndTenant(input: RegisterInput) {
       .values({ name: input.businessName, status: "PROVISIONING", storageMode: "SHARED" })
       .returning();
 
-    // Tenant-scoped write requires SET LOCAL for RLS (Decision TEN-002),
-    // issued on this same transaction before touching core.* tables.
-    await tx.execute(sql`SET LOCAL app.tenant_id = ${tenant!.id}`);
+    // Tenant-scoped write requires setting app.tenant_id for RLS
+    // (Decision TEN-002), issued on this same transaction before
+    // touching core.* tables. Uses set_config() rather than a bare
+    // `SET LOCAL ... = ${..}` statement — PostgreSQL's SET/SET LOCAL
+    // commands do not accept bind parameters for their value; only a
+    // function call like set_config() does. See packages/db/client.ts
+    // withTenantTransaction's `sql_setLocal` docblock for the full
+    // explanation of this bugfix (Phase 2 discovery, tenant-isolation
+    // integration test suite) — this call site had the identical defect.
+    await tx.execute(sql`SELECT set_config('app.tenant_id', ${tenant!.id}, true)`);
 
     await tx.insert(businessProfiles).values({
       tenantId: tenant!.id,

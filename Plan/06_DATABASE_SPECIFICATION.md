@@ -597,6 +597,24 @@ core.stock_balances
 
 **Primary key:** `(tenant_id, item_id, warehouse_id, batch_id)` — composite, treated as materialized cache recomputable from `stock_movements`.
 
+**Uniqueness enforcement — AMENDED (Decision INV-008, Phase 0.5 Reconciliation, second reconciliation pass):**
+
+The composite key above cannot be a literal PostgreSQL `PRIMARY KEY`, because `batch_id` is semantically nullable (non-batch-tracked items — most Electronics/general-retail stock — have no batch) and PostgreSQL forces every `PRIMARY KEY` column `NOT NULL`. A single `UNIQUE INDEX` spanning all four columns does **not** close this gap either: PostgreSQL treats `NULL <> NULL` in unique indexes, so multiple rows sharing the same `(tenant_id, item_id, warehouse_id)` with `batch_id = NULL` would silently pass such an index, breaking the "one balance row per item/warehouse" invariant this table exists to guarantee.
+
+**Corrected implementation:** two partial unique indexes, applied via migration (not expressible cleanly through the ORM's standard index builder, same reasoning already established for `journal_entries`' debit/credit `CHECK` constraint, §5.14):
+
+```sql
+CREATE UNIQUE INDEX stock_balances_pk_batched
+  ON core.stock_balances (tenant_id, item_id, warehouse_id, batch_id)
+  WHERE batch_id IS NOT NULL;
+
+CREATE UNIQUE INDEX stock_balances_pk_unbatched
+  ON core.stock_balances (tenant_id, item_id, warehouse_id)
+  WHERE batch_id IS NULL;
+```
+
+The application schema's own index on this table (if present) is a plain, non-unique lookup index only — it exists for query performance, not constraint enforcement.
+
 ### `core.stock_batches`
 
 **Purpose:** Generic batch concept (Core, not pharmacy-specific — extended by `industry.pharmacy_batch_details`, §7.1).
@@ -1288,6 +1306,9 @@ An Amendment Ledger (§18) is a mandatory, permanent section of this document �
 ### Decision DB-010 (v2.0 — Phase 0.5 Reconciliation)
 `control.tenants` gains `CONSTRAINT owner_required_when_active` (per `05` §75a, Decision TEN-001) and `core.items` gains `allow_negative_stock boolean NOT NULL DEFAULT false` (per `09` §4.7, Decision INV-007) — both ratified during Phase 0.5 Reconciliation, human-approved.
 
+### Decision INV-008 (v2.0 — Phase 0.5 Reconciliation, second reconciliation pass)
+`core.stock_balances`' uniqueness enforcement is corrected from a single `UNIQUE INDEX(tenant_id, item_id, warehouse_id, batch_id)` — which does not actually enforce the intended invariant, since PostgreSQL treats `NULL <> NULL` in unique indexes and `batch_id` is legitimately `NULL` for every non-batch-tracked item — to two partial unique indexes (`batch_id IS NOT NULL` / `batch_id IS NULL`), per §5.10's amended text. Discovered during the `commerce.ts`-vs-spec verification pass; corrected in both the canonical schema text (§5.10) and the implementation (`packages/db/schema/commerce.ts`, `migrations-manual/0005_rls_policies_commerce.sql`).
+
 ---
 
 # 14. Automation Schema — NEW
@@ -1423,6 +1444,7 @@ Every schema change merged into this canonical document, traced to its source do
 | 21 | `05` | §75a (new) | New CHECK constraint | `control.tenants` (owner_required_when_active) | Decision TEN-001 |
 | 22 | `05` | §25 (amended) | No schema change — deployment/config only | — | Decision TEN-002 |
 | 23 | `26` | §6 (amended) | No schema change — algorithm simplification | — | Decision BIL-007 |
+| 24 | `packages/db/schema/commerce.ts` verification pass | §5.10 (amended) | Corrected uniqueness mechanism: single nullable-column unique index replaced with two partial unique indexes (`stock_balances_pk_batched` / `stock_balances_pk_unbatched`), applied via `migrations-manual/0005_rls_policies_commerce.sql` | `core.stock_balances` | Decision INV-008 |
 
 **Items requiring further human decision before these are fully closed:**
 

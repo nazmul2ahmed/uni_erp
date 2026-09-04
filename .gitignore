@@ -1,24 +1,7 @@
-# Dependencies
 node_modules/
-
-# Environment / secrets
-.env
-.env.local
-.env.*.local
-
-# Next.js
 .next/
-out/
-
-# Build / TypeScript
+.env
+.env.*
+!.env.example
 *.tsbuildinfo
-
-# Logs
-*.log
-npm-debug.log*
-pnpm-debug.log*
-yarn-debug.log*
-
-# OS
-.DS_Store
-Thumbs.db
+package-lock.json

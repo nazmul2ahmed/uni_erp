@@ -41,6 +41,34 @@ export const nonNegativeQuantityStringSchema = z
   .trim()
   .regex(/^\d{1,14}(\.\d{1,4})?$/, "Must be a non-negative quantity with at most 4 decimal places");
 
+/**
+ * Strictly positive decimal money string. Mirrors the DB-level
+ * defense-in-depth CHECK constraints added in
+ * migrations-manual/0005_rls_policies_commerce.sql (e.g.
+ * `payments_amount_positive: CHECK (amount > 0)`) — validating this
+ * shape at the schema layer lets an obviously-invalid request
+ * (amount = "0" or "0.00") fail fast with a client-facing 400
+ * instead of reaching the database constraint. The DB CHECK remains
+ * authoritative (04 §12); this is the UX-layer mirror only.
+ */
+export const positiveMoneyStringSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{1,14}(\.\d{1,4})?$/, "Must be a positive amount with at most 4 decimal places")
+  .refine((v) => Number(v) > 0, "Amount must be greater than zero");
+
+/**
+ * Strictly positive decimal quantity string. Mirrors
+ * `sale_items_quantity_positive` / `purchase_items_quantity_positive`
+ * (07 §7.3 invariant 6; 0005_rls_policies_commerce.sql) — same
+ * fail-fast rationale as `positiveMoneyStringSchema` above.
+ */
+export const positiveQuantityStringSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{1,14}(\.\d{1,4})?$/, "Must be a positive quantity with at most 4 decimal places")
+  .refine((v) => Number(v) > 0, "Quantity must be greater than zero");
+
 /** UUID primary/foreign key reference. */
 export const idSchema = z.string().uuid();
 
