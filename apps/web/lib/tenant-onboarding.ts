@@ -10,7 +10,7 @@
  * since both the membership insert and the tenant.status/ownerMembershipId
  * update happen in the same COMMIT.
  */
-import { db, users, tenants, businessProfiles, memberships, roles } from "@erp/db";
+import { accounts, branches, businessProfiles, db, memberships, roles, tenants, units, users, warehouses } from "@erp/db";
 import { AppError } from "@erp/shared";
 import { and, eq, isNull } from "drizzle-orm";
 import { sql } from "drizzle-orm";
@@ -61,6 +61,36 @@ export async function registerOwnerAndTenant(input: RegisterInput) {
       tenantId: tenant!.id,
       name: input.businessName,
     });
+
+    const [branch] = await tx.insert(branches).values({
+      tenantId: tenant!.id,
+      name: "Main Branch",
+      code: "MAIN",
+    }).returning({ id: branches.id });
+    if (!branch) throw new AppError("INTERNAL_ERROR", "Unable to create default branch");
+
+    await tx.insert(warehouses).values({
+      tenantId: tenant!.id,
+      branchId: branch.id,
+      name: "Main Warehouse",
+      code: "MAIN",
+    });
+    await tx.insert(units).values({
+      tenantId: tenant!.id,
+      name: "Default",
+      symbol: "unit",
+      isDecimal: false,
+    });
+    await tx.insert(accounts).values([
+      { tenantId: tenant!.id, code: "1000", name: "Cash", type: "ASSET", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "1010", name: "Bank", type: "ASSET", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "1100", name: "Accounts Receivable", type: "ASSET", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "1200", name: "Inventory", type: "ASSET", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "2000", name: "Accounts Payable", type: "LIABILITY", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "3000", name: "Owner Equity", type: "EQUITY", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "4000", name: "Sales Revenue", type: "INCOME", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "5000", name: "Cost of Goods Sold", type: "EXPENSE", isSystemAccount: true },
+    ]);
 
     const [membership] = await tx
       .insert(memberships)
