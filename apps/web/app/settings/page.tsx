@@ -26,7 +26,7 @@ export default function SettingsPage() {
     if (!profile) return;
     setSaving(true); setSaved(false); setError(null);
     try {
-      const response = await fetch("/api/tenant/profile", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(profile) });
+      const response = await fetch("/api/tenant/profile", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: profile.name, phone: profile.phone || undefined, address: profile.address || undefined, businessType: profile.businessType }) });
       const body = await readEnvelope<Profile>(response);
       if (!response.ok || !body.success || !body.data) throw new Error(body.error?.message || "Unable to save settings");
       setProfile(body.data); setSaved(true);
