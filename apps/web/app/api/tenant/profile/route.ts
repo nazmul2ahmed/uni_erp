@@ -36,7 +36,9 @@ export async function GET() {
     });
     if (!profile) throw new AppError("RESOURCE_NOT_FOUND", "Business profile not found");
 
-    return profile;
+    let settings: { businessType?: string } = {};
+    try { settings = JSON.parse(profile.settingsJson) as { businessType?: string }; } catch { /* use defaults for legacy rows */ }
+    return { ...profile, businessType: settings.businessType ?? "OTHER" };
   })();
 }
 
@@ -44,6 +46,7 @@ const patchSchema = z.object({
   name: z.string().trim().min(1).max(200).optional(),
   phone: z.string().trim().max(50).optional(),
   address: z.string().trim().max(500).optional(),
+  businessType: z.enum(["RETAIL", "WHOLESALE", "PHARMACY", "ELECTRONICS", "DECORATOR", "SERVICE", "MANUFACTURING", "RENTAL", "OTHER"]).optional(),
 });
 
 export async function PATCH(req: NextRequest) {
@@ -56,15 +59,22 @@ export async function PATCH(req: NextRequest) {
     if (!parsed.success) throw new AppError("VALIDATION_FAILED", "Invalid profile payload");
 
     const updated = await withTenantTransaction(ctx.tenantId, async (tx) => {
+      const current = await tx.query.businessProfiles.findFirst({ where: eq(businessProfiles.tenantId, ctx.tenantId) });
+      if (!current) return undefined;
+      let settings: Record<string, unknown> = {};
+      try { settings = JSON.parse(current.settingsJson) as Record<string, unknown>; } catch { /* replace malformed legacy settings */ }
+      const { businessType, ...profileFields } = parsed.data;
       const [row] = await tx
         .update(businessProfiles)
-        .set({ ...parsed.data, updatedAt: new Date() })
+        .set({ ...profileFields, settingsJson: JSON.stringify({ ...settings, ...(businessType ? { businessType } : {}) }), updatedAt: new Date() })
         .where(eq(businessProfiles.tenantId, ctx.tenantId))
         .returning();
       return row;
     });
 
     if (!updated) throw new AppError("RESOURCE_NOT_FOUND", "Business profile not found");
-    return updated;
+    let settings: { businessType?: string } = {};
+    try { settings = JSON.parse(updated.settingsJson) as { businessType?: string }; } catch { /* use defaults for legacy rows */ }
+    return { ...updated, businessType: settings.businessType ?? "OTHER" };
   })();
 }
