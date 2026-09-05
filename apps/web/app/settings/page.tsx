@@ -7,19 +7,27 @@ import { Card } from "@/components/ui/primitives";
 type Profile = { name: string; phone: string | null; address: string | null; businessType: string };
 type Envelope<T> = { success: boolean; data?: T; error?: { message?: string } };
 
+async function readEnvelope<T>(response: Response): Promise<Envelope<T>> {
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    throw new Error(response.ok ? "Settings service returned an invalid response" : `Settings service unavailable (${response.status})`);
+  }
+  return response.json() as Promise<Envelope<T>>;
+}
+
 export default function SettingsPage() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  useEffect(() => { void fetch("/api/tenant/profile").then((response) => response.json() as Promise<Envelope<Profile>>).then((body) => { if (!body.success || !body.data) throw new Error(body.error?.message || "Unable to load settings"); setProfile(body.data); }).catch((err) => setError(err instanceof Error ? err.message : "Unable to load settings")); }, []);
+  useEffect(() => { void fetch("/api/tenant/profile").then((response) => readEnvelope<Profile>(response)).then((body) => { if (!body.success || !body.data) throw new Error(body.error?.message || "Unable to load settings"); setProfile(body.data); }).catch((err) => setError(err instanceof Error ? err.message : "Unable to load settings")); }, []);
   const save = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!profile) return;
     setSaving(true); setSaved(false); setError(null);
     try {
       const response = await fetch("/api/tenant/profile", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(profile) });
-      const body = await response.json() as Envelope<Profile>;
+      const body = await readEnvelope<Profile>(response);
       if (!response.ok || !body.success || !body.data) throw new Error(body.error?.message || "Unable to save settings");
       setProfile(body.data); setSaved(true);
     } catch (err) { setError(err instanceof Error ? err.message : "Unable to save settings"); }
