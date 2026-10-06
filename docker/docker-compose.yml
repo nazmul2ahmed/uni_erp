@@ -1,0 +1,29 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erp
+      POSTGRES_PASSWORD: erp_dev_password
+      POSTGRES_DB: erp_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - erp_pg_data:/var/lib/postgresql/data
+      # Enables pgcrypto + btree_gist on first init (06 v2.0 §15, Decision DB-008)
+      - ./init-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql
+      # Creates the erp_app runtime role (RLS Role Architecture Decision) —
+      # NOSUPERUSER/NOBYPASSRLS, no schema grants yet (control/core don't
+      # exist at this point; grants live in packages/db/migrations-manual/
+      # 0003_grant_app_role.sql, applied by `pnpm db:migrate`).
+      - ./init-roles.sql:/docker-entrypoint-initdb.d/02-init-roles.sql
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+volumes:
+  erp_pg_data:

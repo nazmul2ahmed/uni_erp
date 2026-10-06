@@ -1,0 +1,23 @@
+{
+  "name": "@erp/db",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./client.ts",
+  "types": "./client.ts",
+  "scripts": {
+    "generate": "drizzle-kit generate",
+    "migrate": "tsx migrate.ts",
+    "seed": "tsx seed/seed-control-plane.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.33.0",
+    "postgres": "^3.4.4"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.24.2",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4"
+  }
+}

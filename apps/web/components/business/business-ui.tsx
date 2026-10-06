@@ -1,0 +1,127 @@
+"use client";
+
+import { AlertCircle, ArrowLeft, ChevronLeft, ChevronRight, CircleDollarSign, FileBarChart, LayoutDashboard, LoaderCircle, LogIn, LogOut, MoreHorizontal, Plus, Receipt, Search, Settings, Store, Truck, Users } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { usePathname } from "next/navigation";
+import { AccessProvider } from "@/components/access-context";
+import { visibleNavigation, type NavKey } from "@/lib/navigation";
+
+export type EntityKind = "customer" | "supplier";
+export type EntityRow = { id: string; name: string; phone: string | null; email: string | null; address: string | null; isActive: boolean; createdAt: string; [key: string]: unknown };
+type ApiEnvelope<T> = { success: boolean; data?: T; error?: { message?: string } };
+const endpoint = (kind: EntityKind) => `/api/${kind}s`;
+const title = (kind: EntityKind) => kind === "customer" ? "Customers" : "Suppliers";
+
+const NAV_ICONS: Record<NavKey, typeof Store> = {
+  dashboard: LayoutDashboard, sales: CircleDollarSign, purchases: Truck, customers: Users, suppliers: Truck,
+  finance: CircleDollarSign, expenses: Receipt, reports: FileBarChart, settings: Settings,
+};
+
+type MeResponse = {
+  user: { fullName: string; email: string; mustChangePassword?: boolean };
+  activeTenantId: string | null;
+  activeTenant: { tenantId: string; roleKey: string; permissions: string[] } | null;
+  memberships: Array<{ tenantId: string; tenantName: string }>;
+};
+
+// ADR-001: the platform-operator area is not a workspace -- it must never be wrapped in the tenant sidebar,
+// workspace switcher or tenant /me calls. It renders its own minimal shell.
+export function AppShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  if (pathname.startsWith("/platform")) return <>{children}</>;
+  return <TenantShell>{children}</TenantShell>;
+}
+
+function TenantShell({ children }: { children: React.ReactNode }) {
+  const pathname = usePathname();
+  const router = useRouter();
+  const [user, setUser] = useState<{ fullName: string; email: string } | null>(null);
+  const [business, setBusiness] = useState("Select business");
+  const [businessType, setBusinessType] = useState("OTHER");
+  const [permissions, setPermissions] = useState<string[] | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    void fetch("/api/auth/me")
+      .then((response) => response.json())
+      .then(async (body: ApiEnvelope<MeResponse>) => {
+        if (!active) return;
+        if (body.success && body.data) {
+          setUser(body.data.user);
+          // Decision SEC-008: an account on a one-time password may only reach the change page.
+          if (body.data.user.mustChangePassword && !window.location.pathname.startsWith("/settings/password")) {
+            window.location.replace("/settings/password?required=1");
+            return;
+          }
+          setPermissions(body.data.activeTenant?.permissions ?? null); // Decision NAV-001: display hints; server still enforces
+          setBusiness(body.data.memberships.find((item) => item.tenantId === body.data?.activeTenantId)?.tenantName || "Select business");
+          const profileResponse = await fetch("/api/tenant/profile");
+          const profile = await profileResponse.json() as ApiEnvelope<{ businessType: string }>;
+          if (active && profile.success && profile.data) setBusinessType(profile.data.businessType);
+        }
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, []);
+
+  const logout = async () => {
+    setLoggingOut(true);
+    await fetch("/api/auth/logout", { method: "POST" });
+    setUser(null);
+    setPermissions(null);
+    setBusiness("Select business");
+    setBusinessType("OTHER");
+    setLoggingOut(false);
+    router.push("/login");
+    router.refresh();
+  };
+
+  const links = visibleNavigation(permissions);
+  return <AccessProvider value={{ ready: !loading, permissions }}><div className="app-shell"><aside className="app-sidebar"><div className="app-brand"><span className="brand-mark"><Store size={17} /></span>Ledgerly</div><span className="sidebar-kicker">WORKSPACE</span><nav aria-label="Main navigation" aria-busy={loading}>{links.map(({ key, label, href }) => { const Icon = NAV_ICONS[key]; return <a className={pathname.startsWith(href) ? "app-nav-active" : ""} href={href} key={key}><Icon size={17} />{label}</a>; })}</nav><div className="sidebar-footer">Workspace ready</div></aside><div className="app-main"><header className="app-topbar"><span className="topbar-context">{business}{!loading && user && <small>  {businessType}</small>}</span><div className="topbar-user">{!loading && user ? <><span className="user-avatar">{user.fullName.slice(0, 2).toUpperCase()}</span><span>{user.fullName}</span><a className="topbar-action" href="/settings/password">Password</a><button className="topbar-action" onClick={() => void logout()} disabled={loggingOut} aria-label="Sign out"><LogOut size={15} />Sign out</button></> : !loading ? <a className="topbar-action" href="/login"><LogIn size={15} />Sign in</a> : <span>Loading...</span>}</div></header>{children}</div></div></AccessProvider>;
+}
+
+async function api<T>(url: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(url, options);
+  const body = await response.json() as ApiEnvelope<T>;
+  if (!response.ok || !body.success) throw new Error(body.error?.message || "Unable to complete request");
+  return body.data as T;
+}
+
+export function PageHeader({ kind, action }: { kind: EntityKind; action?: React.ReactNode }) {
+  return <div className="business-header"><div><button className="back-link" onClick={() => window.history.back()}><ArrowLeft size={15} />Back</button><p className="eyebrow">MASTER DATA</p><h1>{title(kind)}</h1><p className="page-description">Manage your {kind === "customer" ? "customers and customer accounts" : "suppliers and payable accounts"}.</p></div>{action}</div>;
+}
+
+export function DataTable({ kind, rows, loading, error, onRetry, onArchive }: { kind: EntityKind; rows: EntityRow[]; loading: boolean; error: string | null; onRetry: () => void; onArchive: (row: EntityRow) => void }) {
+  const router = useRouter(); const [query, setQuery] = useState(""); const [page, setPage] = useState(1); const pageSize = 8;
+  const filtered = useMemo(() => rows.filter((row) => [row.name, row.phone, row.email].some((value) => String(value || "").toLowerCase().includes(query.toLowerCase()))), [rows, query]);
+  const pages = Math.max(1, Math.ceil(filtered.length / pageSize)); const visible = filtered.slice((page - 1) * pageSize, page * pageSize);
+  useEffect(() => { setPage(1); }, [query]);
+  return <section className="table-panel"><div className="table-toolbar"><label className="table-search"><Search size={17} /><input aria-label={`Search ${title(kind)}`} placeholder={`Search ${kind}s...`} value={query} onChange={(event) => setQuery(event.target.value)} /></label><span className="table-count">{filtered.length} records</span></div>{loading ? <div className="table-loading">{[1, 2, 3, 4].map((item) => <div className="skeleton" key={item} />)}</div> : error ? <div className="inline-error"><AlertCircle size={20} /><strong>Unable to load {kind}s</strong><p>{error}</p><button className="button button-outline" onClick={onRetry}>Try again</button></div> : visible.length === 0 ? <div className="inline-empty"><Search size={22} /><strong>{query ? "No matching records" : `No ${kind}s yet`}</strong><p>{query ? "Try a different search term." : `Add your first ${kind} to start building your records.`}</p></div> : <><div className="table-scroll"><table><thead><tr><th>{title(kind).slice(0, -1)}</th><th>Phone</th><th>Email</th>{kind === "supplier" && <th>Contact person</th>}<th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{visible.map((row) => <tr key={row.id}><td><button className="entity-name" onClick={() => router.push(`/${kind}s/${row.id}`)}>{row.name}</button><small>{row.address || "No address"}</small></td><td>{row.phone || "-"}</td><td>{row.email || "-"}</td>{kind === "supplier" && <td>{String(row.contactPerson || "-")}</td>}<td><span className={`status-pill ${row.isActive ? "status-active" : "status-archived"}`}>{row.isActive ? "Active" : "Archived"}</span></td><td><div className="row-actions"><button aria-label={`Edit ${row.name}`} onClick={() => router.push(`/${kind}s/${row.id}/edit`)}>Edit</button><button aria-label={`More actions for ${row.name}`} onClick={() => onArchive(row)}><MoreHorizontal size={17} /></button></div></td></tr>)}</tbody></table></div><div className="pagination"><span>Showing {((page - 1) * pageSize) + 1}-{Math.min(page * pageSize, filtered.length)} of {filtered.length}</span><div><button aria-label="Previous page" disabled={page === 1} onClick={() => setPage(page - 1)}><ChevronLeft size={16} /></button><span>Page {page} of {pages}</span><button aria-label="Next page" disabled={page === pages} onClick={() => setPage(page + 1)}><ChevronRight size={16} /></button></div></div></>}</section>;
+}
+
+export function EntityList({ kind }: { kind: EntityKind }) {
+  const router = useRouter(); const [rows, setRows] = useState<EntityRow[]>([]); const [loading, setLoading] = useState(true); const [error, setError] = useState<string | null>(null); const [archive, setArchive] = useState<EntityRow | null>(null); const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => { setLoading(true); setError(null); try { setRows(await api<EntityRow[]>(endpoint(kind))); } catch (err) { setError(err instanceof Error ? err.message : "Please try again"); } finally { setLoading(false); } }, [kind]);
+  useEffect(() => { void load(); }, [load]);
+  const confirmArchive = async () => { if (!archive) return; setBusy(true); try { await api(`${endpoint(kind)}/${archive.id}/archive`, { method: "POST" }); setArchive(null); await load(); } catch (err) { setError(err instanceof Error ? err.message : "Unable to archive record"); } finally { setBusy(false); } };
+  return <><PageHeader kind={kind} action={<button className="button button-primary" onClick={() => router.push(`/${kind}s/new`)}><Plus size={16} />Add {kind}</button>} /><DataTable kind={kind} rows={rows} loading={loading} error={error} onRetry={load} onArchive={setArchive} />{archive && <div className="dialog-backdrop"><div className="dialog" role="alertdialog" aria-modal="true"><h2>Archive {kind}?</h2><p>This will make <strong>{archive.name}</strong> unavailable for new transactions.</p><div className="dialog-actions"><button className="button button-outline" onClick={() => setArchive(null)}>Cancel</button><button className="button button-destructive" disabled={busy} onClick={confirmArchive}>{busy && <LoaderCircle className="spin" size={15} />}Archive</button></div></div></div>}</>;
+}
+
+export function EntityForm({ kind, id }: { kind: EntityKind; id?: string }) {
+  const router = useRouter(); const editing = Boolean(id); const [form, setForm] = useState<Record<string, string | boolean>>({ name: "", phone: "", email: "", address: "", contactPerson: "", type: "INDIVIDUAL", isWalkIn: false }); const [loading, setLoading] = useState(editing); const [submitting, setSubmitting] = useState(false); const [error, setError] = useState<string | null>(null);
+  useEffect(() => { if (!id) return; void api<EntityRow>(`${endpoint(kind)}/${id}`).then((row) => setForm((current) => ({ ...current, name: row.name, phone: row.phone || "", email: row.email || "", address: row.address || "", contactPerson: typeof row.contactPerson === "string" ? row.contactPerson : "", type: typeof row.type === "string" ? row.type : "INDIVIDUAL", isWalkIn: row.isWalkIn === true }))).catch((err) => setError(err instanceof Error ? err.message : "Unable to load record")).finally(() => setLoading(false)); }, [id, kind]);
+  const update = (field: string, value: string | boolean) => setForm((current) => ({ ...current, [field]: value }));
+  const submit = async (event: React.FormEvent) => { event.preventDefault(); if (!String(form.name).trim()) { setError("Name is required"); return; } setSubmitting(true); setError(null); try { const payload = kind === "customer" ? { type: form.type, name: String(form.name).trim(), phone: String(form.phone).trim() || undefined, email: String(form.email).trim() || undefined, address: String(form.address).trim() || undefined, isWalkIn: form.isWalkIn } : { name: String(form.name).trim(), phone: String(form.phone).trim() || undefined, email: String(form.email).trim() || undefined, address: String(form.address).trim() || undefined, contactPerson: String(form.contactPerson).trim() || undefined }; await api(id ? `${endpoint(kind)}/${id}` : endpoint(kind), { method: id ? "PATCH" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }); router.push(`/${kind}s`); } catch (err) { setError(err instanceof Error ? err.message : "Unable to save record"); } finally { setSubmitting(false); } };
+  if (loading) return <div className="form-loading"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>;
+  return <><PageHeader kind={kind} /><form className="entity-form" onSubmit={submit}><div className="form-section"><div><h2>{editing ? `Edit ${kind}` : `Add ${kind}`}</h2><p>Enter the contact details used across your workspace.</p></div><div className="form-grid"><label>Full name *<input value={String(form.name)} onChange={(event) => update("name", event.target.value)} placeholder={kind === "customer" ? "e.g. Rahim Ahmed" : "e.g. Acme Supplies"} /></label>{kind === "customer" && <label>Type<select value={String(form.type)} onChange={(event) => update("type", event.target.value)}><option value="INDIVIDUAL">Individual</option><option value="ORGANIZATION">Organization</option></select></label>}<label>Phone<input value={String(form.phone)} onChange={(event) => update("phone", event.target.value)} placeholder="01XXXXXXXXX" /></label><label>Email<input type="email" value={String(form.email)} onChange={(event) => update("email", event.target.value)} placeholder="name@example.com" /></label>{kind === "supplier" && <label>Contact person<input value={String(form.contactPerson)} onChange={(event) => update("contactPerson", event.target.value)} /></label>}<label className="wide">Address<textarea value={String(form.address)} onChange={(event) => update("address", event.target.value)} rows={3} /></label>{kind === "customer" && <label className="checkbox-label wide"><input type="checkbox" checked={Boolean(form.isWalkIn)} onChange={(event) => update("isWalkIn", event.target.checked)} />This is a walk-in customer</label>}</div>{error && <div className="form-error" role="alert"><AlertCircle size={17} />{error}</div>}<div className="form-actions"><button type="button" className="button button-outline" onClick={() => router.push(`/${kind}s`)}>Cancel</button><button className="button button-primary" disabled={submitting}>{submitting && <LoaderCircle className="spin" size={15} />}{editing ? "Save changes" : `Create ${kind}`}</button></div></div></form></>;
+}
+
+export function EntityDetail({ kind, id }: { kind: EntityKind; id: string }) {
+  const router = useRouter(); const [row, setRow] = useState<EntityRow | null>(null); const [error, setError] = useState<string | null>(null); useEffect(() => { void api<EntityRow>(`${endpoint(kind)}/${id}`).then(setRow).catch((err) => setError(err instanceof Error ? err.message : "Record not found")); }, [id, kind]);
+  if (error) return <div className="not-found"><h1>{title(kind).slice(0, -1)} not found</h1><p>{error}</p><button className="button button-outline" onClick={() => router.push(`/${kind}s`)}><ArrowLeft size={15} />Back to {title(kind)}</button></div>;
+  if (!row) return <div className="form-loading"><div className="skeleton" /><div className="skeleton" /></div>;
+  return <><div className="detail-header"><div><button className="back-link" onClick={() => router.push(`/${kind}s`)}><ArrowLeft size={15} />Back to {title(kind)}</button><div className="detail-title"><div className="detail-avatar">{row.name.slice(0, 2).toUpperCase()}</div><div><p className="eyebrow">{kind.toUpperCase()} PROFILE</p><h1>{row.name}</h1><span className={`status-pill ${row.isActive ? "status-active" : "status-archived"}`}>{row.isActive ? "Active" : "Archived"}</span></div></div></div><button className="button button-outline" onClick={() => router.push(`/${kind}s/${id}/edit`)}>Edit profile</button></div><div className="detail-grid"><section className="detail-card"><h2>Contact details</h2><dl><dt>Phone</dt><dd>{row.phone || "Not provided"}</dd><dt>Email</dt><dd>{row.email || "Not provided"}</dd><dt>Address</dt><dd>{row.address || "Not provided"}</dd>{kind === "supplier" && <><dt>Contact person</dt><dd>{String(row.contactPerson || "Not provided")}</dd></>}</dl></section><section className="detail-card"><h2>Account activity</h2><div className="unsupported"><p>Transactions and statements will appear here when the Sales and Payments modules are available.</p></div></section></div></>;
+}
