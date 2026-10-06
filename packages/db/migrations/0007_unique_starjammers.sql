@@ -1,0 +1,1 @@
+ALTER TABLE "modules"."rep_stock_assignment_lines" ADD COLUMN "unit_cost" numeric(18, 4) DEFAULT '0' NOT NULL;

@@ -34,3 +34,6 @@ yarn.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Drizzle migration SQL files (source-controlled)
+!packages/db/migrations/*.sql
