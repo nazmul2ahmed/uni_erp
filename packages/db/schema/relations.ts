@@ -2,6 +2,8 @@
 import {
   customers,
   suppliers,
+  items,
+  taxProfiles,
 } from "./core";
 import {
   purchases,
@@ -9,6 +11,17 @@ import {
   receivables,
   payables,
 } from "./commerce";
+
+export const taxProfilesRelations = relations(taxProfiles, ({ many }) => ({
+  items: many(items),
+}));
+
+export const itemsRelations = relations(items, ({ one }) => ({
+  taxProfile: one(taxProfiles, {
+    fields: [items.taxProfileId],
+    references: [taxProfiles.id],
+  }),
+}));
 
 export const customersRelations = relations(customers, ({ many }) => ({
   sales: many(sales),

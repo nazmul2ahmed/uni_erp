@@ -39,7 +39,7 @@
  * create path would have left the same class of gap open.
  */
 import { eq, and, or, ilike, isNull } from "drizzle-orm";
-import { items, itemCategories, brands, units, withTenantTransaction } from "@erp/db";
+import { items, itemCategories, brands, units, taxProfiles, withTenantTransaction } from "@erp/db";
 import type { Database } from "@erp/db";
 import { AppError } from "@erp/shared";
 import type { TenantContext } from "../guard";
@@ -65,7 +65,7 @@ function isUniqueViolation(e: unknown): boolean {
 async function assertItemForeignKeysBelongToTenant(
   tx: Database,
   tenantId: string,
-  refs: { categoryId?: string; brandId?: string; unitId?: string },
+  refs: { categoryId?: string; brandId?: string; unitId?: string; taxProfileId?: string | null },
 ): Promise<void> {
   if (refs.categoryId) {
     const row = await tx.query.itemCategories.findFirst({
@@ -90,6 +90,14 @@ async function assertItemForeignKeysBelongToTenant(
     if (!row) {
       throw new AppError("VALIDATION_FAILED", "unitId does not belong to this tenant", { field: "unitId" });
     }
+    if (refs.taxProfileId) {
+      const row = await tx.query.taxProfiles.findFirst({
+        where: and(eq(taxProfiles.id, refs.taxProfileId), eq(taxProfiles.tenantId, tenantId)),
+      });
+      if (!row) {
+        throw new AppError("VALIDATION_FAILED", "taxProfileId does not belong to this tenant", { field: "taxProfileId" });
+      }
+    }
   }
 }
 
@@ -105,6 +113,7 @@ export async function listItems(ctx: TenantContext, opts: { q?: string; limit?: 
     }
     return tx.query.items.findMany({
       where: and(...conditions),
+      with: { taxProfile: { columns: { id: true, name: true, rate: true, isInclusive: true } } },
       orderBy: (i, { asc }) => [asc(i.name)],
       limit,
       offset,
@@ -116,6 +125,7 @@ export async function getItem(ctx: TenantContext, id: string) {
   return withTenantTransaction(ctx.tenantId, async (tx) => {
     const row = await tx.query.items.findFirst({
       where: and(eq(items.id, id), eq(items.tenantId, ctx.tenantId), isNull(items.deletedAt)),
+      with: { taxProfile: { columns: { id: true, name: true, rate: true, isInclusive: true } } },
     });
     if (!row) throw new AppError("RESOURCE_NOT_FOUND", "Item not found");
     return row;
@@ -129,6 +139,7 @@ export async function createItem(ctx: TenantContext, input: CreateItemInput) {
         categoryId: input.categoryId,
         brandId: input.brandId,
         unitId: input.unitId,
+        taxProfileId: input.taxProfileId,
       });
 
       const [row] = await tx
@@ -150,6 +161,7 @@ export async function createItem(ctx: TenantContext, input: CreateItemInput) {
           serialTracked: input.serialTracked,
           rentalTracked: input.rentalTracked,
           warrantyTracked: input.warrantyTracked,
+          taxProfileId: input.taxProfileId ?? null,
           createdBy: ctx.userId,
           updatedBy: ctx.userId,
         })
@@ -177,6 +189,7 @@ export async function updateItem(ctx: TenantContext, id: string, input: UpdateIt
         categoryId: input.categoryId,
         brandId: input.brandId,
         unitId: input.unitId,
+        taxProfileId: input.taxProfileId,
       });
 
       // Merged-state cross-field invariant re-check (07 §6.1) — see

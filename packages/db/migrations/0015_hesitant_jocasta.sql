@@ -1,0 +1,2 @@
+ALTER TABLE "core"."sales" ADD COLUMN "cancel_operation_id" uuid;--> statement-breakpoint
+CREATE UNIQUE INDEX IF NOT EXISTS "sales_tenant_cancel_operation_unique" ON "core"."sales" USING btree ("tenant_id","cancel_operation_id");

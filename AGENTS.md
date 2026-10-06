@@ -54,7 +54,15 @@ pnpm dev           # starts apps/web on :3000
 
 ## Current phase
 
-**Phase 1 — Platform Foundation** (per `28_IMPLEMENTATION_ROADMAP.md` §4).
-Scope: Auth, Tenant, Membership, RBAC only. Do NOT add Sales/Purchase/
-Inventory/Accounting code yet — that is Phase 2 (`07`–`09`), sequenced
-after Phase 1 exit criteria are verified.
+**Development follows `28_IMPLEMENTATION_ROADMAP.md` §4 in order.**
+The user has directed that code development continue while non-code
+deployment work is deferred. Therefore, continue the next roadmap
+implementation milestones locally; do not wait for external staging
+provisioning to write/test code.
+
+This does NOT waive or mark complete any phase exit criterion.
+Phase 1's isolated staging/deployment acceptance remains open until a
+staging environment is provisioned and verified per `25` §§2–3. Track
+development progress separately from release readiness in
+`IMPLEMENTATION_PROGRESS.md`; never claim a phase is formally exited
+while its acceptance criteria remain unmet.

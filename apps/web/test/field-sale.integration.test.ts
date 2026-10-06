@@ -11,7 +11,7 @@ import { and, eq, isNull } from "drizzle-orm";
 import {
   accounts, businessProfiles, db, items, journalEntries, journals, memberships, paymentAllocations, payments,
   receivables, repCustodyBalances, repStockAssignmentLines, repStockAssignments, repStockMovements, roles,
-  rolePermissions, saleItems, sales, stockAdjustments, stockBalances, stockMovements, tenants, units, users,
+  rolePermissions, saleItems, sales, stockAdjustments, stockBalances, stockBatches, stockMovements, tenants, units, users,
   withTenantTransaction,
 } from "@erp/db";
 import type { TenantContext } from "../lib/guard";
@@ -45,6 +45,28 @@ async function stockedItem(qty: string) {
   const item = await createItem(ownerCtx, { name: `FS Item ${randomUUID()}`, type: "PRODUCT", unitId: unit.id, sellingPrice: "500.00", purchasePrice: "300.00", stockTracked: true } as never);
   await adjustStock(ownerCtx, { itemId: item.id, warehouseId, quantityDelta: qty, reason: "seed" } as never, randomUUID());
   return item;
+}
+
+async function fifoStockedItem() {
+  const unit = await createUnit(ownerCtx, { name: `U-${randomUUID()}`, symbol: "pc" } as never);
+  const item = await createItem(ownerCtx, { name: `FIFO Item ${randomUUID()}`, type: "PRODUCT", unitId: unit.id, sellingPrice: "500.00", purchasePrice: "300.00", stockTracked: true, batchTracked: true } as never);
+  const batches = await withTenantTransaction(tenantId, async (tx) => {
+    const olderReceivedAt = new Date("2025-01-01T00:00:00.000Z");
+    const newerReceivedAt = new Date("2025-02-01T00:00:00.000Z");
+    const [older] = await tx.insert(stockBatches).values({ tenantId, itemId: item.id, batchNumber: `FIFO-OLD-${randomUUID()}`, receivedAt: olderReceivedAt, costPrice: "100.0000" }).returning();
+    const [newer] = await tx.insert(stockBatches).values({ tenantId, itemId: item.id, batchNumber: `FIFO-NEW-${randomUUID()}`, receivedAt: newerReceivedAt, costPrice: "200.0000" }).returning();
+    if (!older || !newer) throw new Error("Unable to create FIFO test batches");
+    await tx.insert(stockBalances).values([
+      { tenantId, itemId: item.id, warehouseId, batchId: older.id, quantityOnHand: "5.0000", weightedAvgCost: null },
+      { tenantId, itemId: item.id, warehouseId, batchId: newer.id, quantityOnHand: "5.0000", weightedAvgCost: null },
+    ]);
+    await tx.insert(stockMovements).values([
+      { tenantId, itemId: item.id, warehouseId, batchId: older.id, movementType: "PURCHASE", quantity: "5.0000", operationId: randomUUID() },
+      { tenantId, itemId: item.id, warehouseId, batchId: newer.id, movementType: "PURCHASE", quantity: "5.0000", operationId: randomUUID() },
+    ]);
+    return [older, newer] as const;
+  });
+  return { item, batches };
 }
 
 const saleBody = (item: { id: string; sellingPrice: string }, qty: string, repAssignmentId?: string) =>
@@ -89,6 +111,7 @@ afterAll(async () => {
     await tx.delete(stockMovements).where(eq(stockMovements.tenantId, tenantId));
     await tx.delete(stockAdjustments).where(eq(stockAdjustments.tenantId, tenantId));
     await tx.delete(stockBalances).where(eq(stockBalances.tenantId, tenantId));
+    await tx.delete(stockBatches).where(eq(stockBatches.tenantId, tenantId));
     await tx.delete(items).where(eq(items.tenantId, tenantId));
     await tx.delete(units).where(eq(units.tenantId, tenantId));
     await tx.delete(businessProfiles).where(eq(businessProfiles.tenantId, tenantId));
@@ -139,6 +162,50 @@ describe("field sale — NO double deduction (Decision VAN-012)", () => {
     expect(await onHand(item.id)).toBe("18.0000");
     expect((await accountNet("1200", sale.id)).credit).toBeCloseTo(600);
     expect((await accountNet("1250", sale.id)).credit).toBe(0);
+  });
+
+  it("allocates oldest batch first, splits the sale line, and posts batch-specific COGS", async () => {
+    const { item, batches } = await fifoStockedItem();
+    const input = {
+      ...(saleBody(item, "6") as object),
+      lines: [{ itemId: item.id, quantity: "6", unitPrice: item.sellingPrice, lineDiscount: "13.33", warehouseId }],
+      cashReceived: "2986.67",
+    } as never;
+    const sale = await completeSale(ownerCtx, input, randomUUID());
+
+    const soldLines = await withTenantTransaction(tenantId, (tx) => tx.query.saleItems.findMany({ where: (line, { eq: e }) => e(line.saleId, sale.id) }));
+    expect(soldLines).toHaveLength(2);
+    expect(soldLines.map((line) => [line.batchId, line.quantity])).toEqual([
+      [batches[0].id, "5.0000"],
+      [batches[1].id, "1.0000"],
+    ]);
+    expect(soldLines.reduce((sum, line) => sum + Number(line.lineDiscount), 0)).toBeCloseTo(13.33);
+    expect(soldLines.reduce((sum, line) => sum + Number(line.lineTotal), 0)).toBeCloseTo(2986.67);
+
+    const balances = await withTenantTransaction(tenantId, (tx) => tx.query.stockBalances.findMany({ where: (balance, { eq: e }) => e(balance.itemId, item.id) }));
+    expect(balances.find((balance) => balance.batchId === batches[0].id)?.quantityOnHand).toBe("0.0000");
+    expect(balances.find((balance) => balance.batchId === batches[1].id)?.quantityOnHand).toBe("4.0000");
+    expect((await accountNet("5000", sale.id)).debit).toBeCloseTo(700);
+    expect((await accountNet("1200", sale.id)).credit).toBeCloseTo(700);
+  });
+
+  it("rejects duplicate lines whose combined quantity exceeds available stock and rolls back", async () => {
+    const item = await stockedItem("5");
+    const operationId = randomUUID();
+    const line = { itemId: item.id, quantity: "3", unitPrice: item.sellingPrice, lineDiscount: "0", warehouseId };
+    const input = {
+      ...(saleBody(item, "3") as object),
+      lines: [line, line],
+      cashReceived: String(Number(item.sellingPrice) * 6),
+    } as never;
+
+    await expect(completeSale(ownerCtx, input, operationId)).rejects.toMatchObject({ code: "INSUFFICIENT_STOCK" });
+
+    expect(await onHand(item.id)).toBe("5.0000");
+    const persistedSale = await withTenantTransaction(tenantId, (tx) => tx.query.sales.findFirst({ where: (sale, { eq: equals }) => equals(sale.operationId, operationId) }));
+    expect(persistedSale).toBeUndefined();
+    const saleMovements = await withTenantTransaction(tenantId, (tx) => tx.query.stockMovements.findMany({ where: (movement, { eq: equals, and: both }) => both(equals(movement.itemId, item.id), equals(movement.movementType, "SALE")) }));
+    expect(saleMovements).toHaveLength(0);
   });
 });
 

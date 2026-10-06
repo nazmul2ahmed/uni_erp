@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, lte } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, lte } from "drizzle-orm";
 import {
   accounts,
   customers,
@@ -57,7 +57,7 @@ async function recordPayment(
     let remaining = moneyUnits(input.amount);
     const candidates = requestedAllocations.length > 0
       ? requestedAllocations.map((allocation) => ({ id: "saleId" in allocation ? allocation.saleId : allocation.purchaseId, amount: allocation.amount }))
-      : openRows.map(({ targetId, row }) => ({ id: targetId, amount: row.balance }));
+      : openRows.flatMap(({ targetId, row }) => targetId ? [{ id: targetId, amount: row.balance }] : []);
 
     for (const candidate of candidates) {
       const target = byTarget.get(candidate.id);
@@ -65,8 +65,45 @@ async function recordPayment(
       const amount = moneyUnits(candidate.amount);
       const balance = moneyUnits(target.balance);
       if (amount <= 0n || amount > balance || amount > remaining) throw new AppError("VALIDATION_FAILED", "Payment allocation exceeds the outstanding balance");
-      allocations.push({ id: target.id, amount: candidate.amount });
+      allocations.push({ id: candidate.id, amount: candidate.amount });
       remaining -= amount;
+    }
+
+    if (partyType === "CUSTOMER" && allocations.length > 0) {
+      const targetIds = [...new Set(allocations.map((allocation) => allocation.id))].sort();
+      const lockedSales = await tx.select({ id: sales.id, status: sales.status })
+        .from(sales)
+        .where(and(eq(sales.tenantId, ctx.tenantId), inArray(sales.id, targetIds)))
+        .orderBy(asc(sales.id))
+        .for("update");
+      if (lockedSales.length !== targetIds.length) {
+        throw new AppError("RESOURCE_NOT_FOUND", "Payment allocation target not found");
+      }
+      if (lockedSales.some((sale) => sale.status === "CANCELLED")) {
+        throw new AppError("VALIDATION_FAILED", "Payments cannot be allocated to a cancelled sale");
+      }
+      const lockedReceivables = await tx.select().from(receivables)
+        .where(and(
+          eq(receivables.tenantId, ctx.tenantId),
+          eq(receivables.customerId, partyId),
+          inArray(receivables.saleId, targetIds),
+        ))
+        .orderBy(asc(receivables.saleId))
+        .for("update");
+      const receivableBySale = new Map(lockedReceivables.flatMap((row) => row.saleId ? [[row.saleId, row] as const] : []));
+      const requestedBySale = new Map<string, bigint>();
+      for (const allocation of allocations) {
+        const target = receivableBySale.get(allocation.id);
+        if (!target || !["OPEN", "PARTIAL"].includes(target.status)) {
+          throw new AppError("RESOURCE_NOT_FOUND", "Payment allocation target not found or already settled");
+        }
+        const requested = (requestedBySale.get(allocation.id) ?? 0n) + moneyUnits(allocation.amount);
+        if (requested > moneyUnits(target.balance)) {
+          throw new AppError("VALIDATION_FAILED", "Payment allocation exceeds the outstanding balance");
+        }
+        requestedBySale.set(allocation.id, requested);
+        byTarget.set(allocation.id, target);
+      }
     }
 
     const [payment] = await tx.insert(payments).values({
@@ -91,6 +128,7 @@ async function recordPayment(
       if (partyType === "CUSTOMER") {
         await tx.update(receivables).set({ paidAmount: decimal(paid), balance: decimal(balance), status: balance === 0n ? "SETTLED" : "PARTIAL", updatedAt: new Date() }).where(and(eq(receivables.id, target.id), eq(receivables.tenantId, ctx.tenantId)));
         await tx.update(sales).set({ paidTotal: decimal(paid), dueTotal: decimal(balance), status: balance === 0n ? "PAID" : "PARTIALLY_PAID", updatedAt: new Date() }).where(and(eq(sales.id, allocation.id), eq(sales.tenantId, ctx.tenantId)));
+        byTarget.set(allocation.id, { ...target, paidAmount: decimal(paid), balance: decimal(balance), status: balance === 0n ? "SETTLED" : "PARTIAL" });
       } else {
         await tx.update(payables).set({ paidAmount: decimal(paid), balance: decimal(balance), status: balance === 0n ? "SETTLED" : "PARTIAL", updatedAt: new Date() }).where(and(eq(payables.id, target.id), eq(payables.tenantId, ctx.tenantId)));
         await tx.update(purchases).set({ paidTotal: decimal(paid), dueTotal: decimal(balance), status: balance === 0n ? "PAID" : "PARTIALLY_PAID", updatedAt: new Date() }).where(and(eq(purchases.id, allocation.id), eq(purchases.tenantId, ctx.tenantId)));

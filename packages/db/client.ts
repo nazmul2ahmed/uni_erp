@@ -25,6 +25,7 @@ import * as controlSchema from "./schema/control";
 import * as coreSchema from "./schema/core";
 import * as commerceSchema from "./schema/commerce";
 import * as modulesSchema from "./schema/modules";
+import * as relationsSchema from "./schema/relations";
 
 // FIX (found during Van Sales Phase 4 trace, this session): `modules`
 // schema tables (repStockAssignments etc., schema/modules.ts) were
@@ -40,7 +41,7 @@ import * as modulesSchema from "./schema/modules";
 // control/core/commerce's exports before merging (modules.ts exports
 // only `modules`, `repStockAssignments`, `repStockAssignmentLines`,
 // `repStockMovements`, `repCustodyBalances`).
-const schema = { ...controlSchema, ...coreSchema, ...commerceSchema, ...modulesSchema };
+const schema = { ...controlSchema, ...coreSchema, ...commerceSchema, ...modulesSchema, ...relationsSchema };
 
 // Runtime application connections use the non-superuser, non-owner
 // erp_app role (RLS Role Architecture Decision) — NOT the migration/

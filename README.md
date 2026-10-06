@@ -3,6 +3,7 @@
 Phase 1 (Platform Foundation) scaffold. Governed by the specification
 series `01_EXISTING_PHARMACY_SYSTEM_AUDIT.md` through
 `29_AI_CODING_PROTOCOL.md` (see `AGENTS.md` for the AI-assistance index).
+Roadmap execution status and verification log: [IMPLEMENTATION_PROGRESS.md](./IMPLEMENTATION_PROGRESS.md).
 
 ## Stack (frozen, per `04_PLATFORM_ARCHITECTURE.md`)
 
@@ -108,7 +109,21 @@ pnpm db:seed
 pnpm dev
 ```
 
-## Phase 1 Exit Criteria (per `28` §4 — verify before starting Phase 2)
+Browser acceptance tests (require the local database to be migrated and seeded):
+
+```bash
+pnpm --filter web exec playwright install chromium   # first run only
+pnpm --filter web test:e2e
+```
+
+The browser suite covers Phase 1 onboarding/tenant access and the Phase 2
+Purchase → Stock → POS Sale → later Payment → Customer Due → P&L workflow.
+
+## Phase 1 Formal Release Gate (per `28` §4)
+
+These criteria govern formal Phase 1 exit; local Phase 2 development may
+continue while non-code staging work is deferred, as recorded in
+[`IMPLEMENTATION_PROGRESS.md`](./IMPLEMENTATION_PROGRESS.md).
 
 - [ ] A user can register, log in, create a tenant, become its Owner
 - [ ] Membership/Role/Permission resolve correctly end-to-end

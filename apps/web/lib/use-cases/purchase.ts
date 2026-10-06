@@ -8,6 +8,7 @@ import {
   stockBatches,
   stockBalances,
   stockMovements,
+  taxProfiles,
   suppliers,
   items,
   warehouses,
@@ -19,27 +20,7 @@ import type { CreatePurchaseInput, SearchPurchasesQuery } from "@erp/validation"
 import type { TenantContext } from "../guard";
 import { postPurchaseJournal } from "../accounting";
 import { recordAudit } from "../audit";
-
-const moneyScale = 10000n;
-
-function decimalToUnits(value: string): bigint {
-  const [whole, fraction = ""] = value.split(".");
-  return BigInt(whole ?? "0") * moneyScale + BigInt(fraction.padEnd(4, "0").slice(0, 4));
-}
-
-function unitsToDecimal(value: bigint): string {
-  const absolute = value < 0n ? -value : value;
-  const whole = absolute / moneyScale;
-  const fraction = (absolute % moneyScale).toString().padStart(4, "0").replace(/0+$/, "");
-  return `${value < 0n ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
-}
-
-function lineTotal(quantity: string, costPrice: string, discount: string): string {
-  const quantityUnits = decimalToUnits(quantity);
-  const costUnits = decimalToUnits(costPrice);
-  const discountUnits = decimalToUnits(discount);
-  return unitsToDecimal((quantityUnits * costUnits) / moneyScale - discountUnits);
-}
+import { allocateProportionally, decimalToUnits, moneyScale, multiplyToMoneyUnits, roundRatio, taxForAmount, unitsToDecimal } from "../money";
 
 function purchaseNumber(): string {
   return `PUR-${new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
@@ -69,19 +50,63 @@ export async function receivePurchase(ctx: TenantContext, input: CreatePurchaseI
     if (existing) return existing;
 
     const { warehouseMap, itemMap } = await getOwnedReferences(tx, ctx, input);
+    const taxProfileRows = await tx.query.taxProfiles.findMany({
+      where: eq(taxProfiles.tenantId, ctx.tenantId),
+    });
+    const taxProfileById = new Map(taxProfileRows.map((taxProfile) => [taxProfile.id, taxProfile]));
     const computedLines = input.lines.map((line) => {
       const item = itemMap.get(line.itemId)!;
+      const taxProfile = item.taxProfileId ? taxProfileById.get(item.taxProfileId) : undefined;
+      if (item.taxProfileId && !taxProfile) {
+        throw new AppError("VALIDATION_FAILED", `${item.name} tax profile is unavailable for this tenant`);
+      }
+      if (taxProfile?.isInclusive) {
+        throw new AppError("VALIDATION_FAILED", `${item.name} uses an unsupported tax-inclusive profile`);
+      }
       if ((item.batchTracked || item.expiryTracked) && !line.batchNumber) throw new AppError("VALIDATION_FAILED", `${item.name} requires a batch number`);
       if (item.expiryTracked && !line.expiryDate) throw new AppError("VALIDATION_FAILED", `${item.name} requires an expiry date`);
       if (line.expiryDate && input.purchaseDate && line.expiryDate < input.purchaseDate.slice(0, 10)) throw new AppError("VALIDATION_FAILED", `${item.name} expiry cannot be before the purchase date`);
-      const total = lineTotal(line.quantity, line.costPrice, line.lineDiscount);
-      if (decimalToUnits(total) < 0n) throw new AppError("VALIDATION_FAILED", "Line discount cannot exceed line value");
-      return { line, item, warehouse: warehouseMap.get(line.warehouseId)!, total };
+      const subtotalUnits = multiplyToMoneyUnits(decimalToUnits(line.quantity), decimalToUnits(line.costPrice));
+      const lineDiscountUnits = decimalToUnits(line.lineDiscount);
+      if (subtotalUnits - lineDiscountUnits < 0n) throw new AppError("VALIDATION_FAILED", "Line discount cannot exceed line value");
+      return {
+        line,
+        item,
+        warehouse: warehouseMap.get(line.warehouseId)!,
+        subtotalUnits,
+        lineDiscountUnits,
+        orderDiscountUnits: 0n,
+        taxProfileId: taxProfile?.id ?? null,
+        taxRate: taxProfile?.rate ?? "0",
+        taxAmountUnits: 0n,
+        lineTotalUnits: 0n,
+        inventoryCostUnits: 0n,
+        inventoryUnitCostUnits: 0n,
+      };
     });
-    const subtotalUnits = computedLines.reduce((sum, entry) => sum + decimalToUnits(entry.line.quantity) * decimalToUnits(entry.line.costPrice) / moneyScale, 0n);
-    const lineDiscountUnits = computedLines.reduce((sum, entry) => sum + decimalToUnits(entry.line.lineDiscount), 0n);
-    const grandTotalUnits = subtotalUnits - lineDiscountUnits - decimalToUnits(input.orderDiscount);
-    if (grandTotalUnits < 0n) throw new AppError("VALIDATION_FAILED", "Discounts cannot exceed the purchase subtotal");
+    const subtotalUnits = computedLines.reduce((sum, entry) => sum + entry.subtotalUnits, 0n);
+    const lineDiscountUnits = computedLines.reduce((sum, entry) => sum + entry.lineDiscountUnits, 0n);
+    const orderDiscountUnits = decimalToUnits(input.orderDiscount);
+    const discountUnits = lineDiscountUnits + orderDiscountUnits;
+    if (subtotalUnits - discountUnits < 0n) throw new AppError("VALIDATION_FAILED", "Discounts cannot exceed the purchase subtotal");
+    const orderDiscountAllocations = allocateProportionally(
+      orderDiscountUnits,
+      computedLines.map((entry) => entry.subtotalUnits - entry.lineDiscountUnits),
+    );
+    let taxTotalUnits = 0n;
+    for (const [index, entry] of computedLines.entries()) {
+      entry.orderDiscountUnits = orderDiscountAllocations[index]!;
+      const taxableUnits = entry.subtotalUnits - entry.lineDiscountUnits - entry.orderDiscountUnits;
+      entry.taxAmountUnits = taxForAmount(taxableUnits, entry.taxRate);
+      entry.lineTotalUnits = entry.subtotalUnits - entry.lineDiscountUnits + entry.taxAmountUnits;
+      entry.inventoryCostUnits = taxableUnits + entry.taxAmountUnits;
+      entry.inventoryUnitCostUnits = roundRatio(
+        entry.inventoryCostUnits * moneyScale,
+        decimalToUnits(entry.line.quantity),
+      );
+      taxTotalUnits += entry.taxAmountUnits;
+    }
+    const grandTotalUnits = subtotalUnits - discountUnits + taxTotalUnits;
     const paidUnits = decimalToUnits(input.cashPaid);
     if (paidUnits > grandTotalUnits) throw new AppError("VALIDATION_FAILED", "Payment cannot exceed the purchase total");
     const grandTotal = unitsToDecimal(grandTotalUnits);
@@ -90,26 +115,28 @@ export async function receivePurchase(ctx: TenantContext, input: CreatePurchaseI
     const status = paidUnits === grandTotalUnits ? "PAID" : paidUnits > 0n ? "PARTIALLY_PAID" : "RECEIVED";
     const [purchase] = await tx.insert(purchases).values({
       tenantId: ctx.tenantId, branchId: input.branchId, purchaseNumber: purchaseNumber(), supplierId: input.supplierId,
-      status, subtotal: unitsToDecimal(subtotalUnits), discountTotal: unitsToDecimal(lineDiscountUnits + decimalToUnits(input.orderDiscount)),
-      taxTotal: "0", grandTotal, paidTotal, dueTotal, purchaseDate: input.purchaseDate ? new Date(input.purchaseDate) : new Date(), operationId, createdBy: ctx.userId,
+      status, subtotal: unitsToDecimal(subtotalUnits), discountTotal: unitsToDecimal(discountUnits),
+      taxTotal: unitsToDecimal(taxTotalUnits), grandTotal, paidTotal, dueTotal, purchaseDate: input.purchaseDate ? new Date(input.purchaseDate) : new Date(), operationId, createdBy: ctx.userId,
     }).returning();
     if (!purchase) throw new AppError("INTERNAL_ERROR", "Unable to create purchase");
 
     for (const entry of computedLines) {
-      const { line, item, warehouse, total } = entry;
+      const { line, item, warehouse } = entry;
       let batchId: string | null = null;
       if (line.batchNumber) {
         const existingBatch = await tx.query.stockBatches.findFirst({ where: and(eq(stockBatches.tenantId, ctx.tenantId), eq(stockBatches.itemId, item.id), eq(stockBatches.batchNumber, line.batchNumber)) });
         if (existingBatch) batchId = existingBatch.id;
         else {
-          const [batch] = await tx.insert(stockBatches).values({ tenantId: ctx.tenantId, itemId: item.id, batchNumber: line.batchNumber, expiryDate: line.expiryDate, supplierId: input.supplierId, costPrice: line.costPrice }).returning({ id: stockBatches.id });
+          const [batch] = await tx.insert(stockBatches).values({ tenantId: ctx.tenantId, itemId: item.id, batchNumber: line.batchNumber, expiryDate: line.expiryDate, supplierId: input.supplierId, costPrice: unitsToDecimal(entry.inventoryUnitCostUnits) }).returning({ id: stockBatches.id });
           batchId = batch!.id;
         }
       }
-      await tx.insert(purchaseItems).values({ tenantId: ctx.tenantId, purchaseId: purchase.id, itemId: item.id, description: line.description, quantity: line.quantity, costPrice: line.costPrice, sellingPrice: line.sellingPrice, lineDiscount: line.lineDiscount, taxAmount: "0", lineTotal: total, batchNumber: line.batchNumber, expiryDate: line.expiryDate, warehouseId: warehouse.id });
+      await tx.insert(purchaseItems).values({ tenantId: ctx.tenantId, purchaseId: purchase.id, itemId: item.id, description: line.description, quantity: line.quantity, costPrice: line.costPrice, sellingPrice: line.sellingPrice, lineDiscount: line.lineDiscount, orderDiscountAllocation: unitsToDecimal(entry.orderDiscountUnits), taxProfileId: entry.taxProfileId, taxRate: entry.taxRate, taxAmount: unitsToDecimal(entry.taxAmountUnits), lineTotal: unitsToDecimal(entry.lineTotalUnits), batchNumber: line.batchNumber, expiryDate: line.expiryDate, warehouseId: warehouse.id });
       await tx.insert(stockMovements).values({ tenantId: ctx.tenantId, itemId: item.id, warehouseId: warehouse.id, batchId, movementType: "PURCHASE", quantity: line.quantity, referenceType: "PURCHASE", referenceId: purchase.id, operationId: crypto.randomUUID(), createdBy: ctx.userId });
       const batchCondition = batchId ? eq(stockBalances.batchId, batchId) : isNull(stockBalances.batchId);
-      const balance = await tx.query.stockBalances.findFirst({ where: and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, item.id), eq(stockBalances.warehouseId, warehouse.id), batchCondition) });
+      const [balance] = await tx.select().from(stockBalances)
+        .where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, item.id), eq(stockBalances.warehouseId, warehouse.id), batchCondition))
+        .for("update");
       const priorQuantityUnits = decimalToUnits(balance?.quantityOnHand ?? "0");
       const purchasedUnits = decimalToUnits(line.quantity);
       const nextQuantity = priorQuantityUnits + purchasedUnits;
@@ -121,11 +148,29 @@ export async function receivePurchase(ctx: TenantContext, input: CreatePurchaseI
       // "null for batch/serial-valued items").
       let nextWeightedAvgCost: string | null = null;
       if (!batchId) {
-        const priorCostUnits = balance?.weightedAvgCost ? decimalToUnits(balance.weightedAvgCost) : decimalToUnits(line.costPrice);
-        const priorValueUnits = (priorCostUnits * priorQuantityUnits) / moneyScale;
-        const purchaseValueUnits = (decimalToUnits(line.costPrice) * purchasedUnits) / moneyScale;
+        const priorCostUnits = balance?.weightedAvgCost ? decimalToUnits(balance.weightedAvgCost) : entry.inventoryUnitCostUnits;
+        const priorValueUnits = multiplyToMoneyUnits(priorQuantityUnits, priorCostUnits);
+        const purchaseValueUnits = entry.inventoryCostUnits;
         const nextValueUnits = priorValueUnits + purchaseValueUnits;
-        nextWeightedAvgCost = nextQuantity > 0n ? unitsToDecimal((nextValueUnits * moneyScale) / nextQuantity) : line.costPrice;
+        nextWeightedAvgCost = nextQuantity > 0n ? unitsToDecimal(roundRatio(nextValueUnits * moneyScale, nextQuantity)) : unitsToDecimal(entry.inventoryUnitCostUnits);
+      }
+
+      if (batchId) {
+        const [batch] = await tx.select().from(stockBatches)
+          .where(and(eq(stockBatches.id, batchId), eq(stockBatches.tenantId, ctx.tenantId)))
+          .for("update");
+        if (!batch) throw new AppError("RESOURCE_NOT_FOUND", `${item.name} batch not found`);
+        const batchBalances = await tx.select().from(stockBalances)
+          .where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, item.id), eq(stockBalances.batchId, batchId)))
+          .for("update");
+        const priorBatchQuantity = batchBalances.reduce((sum, row) => sum + decimalToUnits(row.quantityOnHand), 0n);
+        const priorBatchValue = multiplyToMoneyUnits(priorBatchQuantity, decimalToUnits(batch.costPrice));
+        const nextBatchUnitCost = roundRatio(
+          (priorBatchValue + entry.inventoryCostUnits) * moneyScale,
+          priorBatchQuantity + purchasedUnits,
+        );
+        await tx.update(stockBatches).set({ costPrice: unitsToDecimal(nextBatchUnitCost) })
+          .where(and(eq(stockBatches.id, batchId), eq(stockBatches.tenantId, ctx.tenantId)));
       }
 
       if (balance) await tx.update(stockBalances).set({ quantityOnHand: unitsToDecimal(nextQuantity), weightedAvgCost: nextWeightedAvgCost, updatedAt: new Date() }).where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, item.id), eq(stockBalances.warehouseId, warehouse.id), batchCondition));
@@ -135,7 +180,7 @@ export async function receivePurchase(ctx: TenantContext, input: CreatePurchaseI
       // comment) so a later Sale's COGS fallback (sale.ts, when no
       // weightedAvgCost/batch is available) reflects the most recent
       // purchase rather than a stale onboarding-time default.
-      await tx.update(items).set({ purchasePrice: line.costPrice, updatedAt: new Date() }).where(and(eq(items.id, item.id), eq(items.tenantId, ctx.tenantId)));
+      await tx.update(items).set({ purchasePrice: unitsToDecimal(entry.inventoryUnitCostUnits), updatedAt: new Date() }).where(and(eq(items.id, item.id), eq(items.tenantId, ctx.tenantId)));
     }
     if (paidUnits > 0n) {
       const paymentId = crypto.randomUUID();

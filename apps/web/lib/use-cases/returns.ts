@@ -43,6 +43,52 @@ function sumQuantities(rows: Array<{ quantity: string }>): bigint {
   return rows.reduce((total, row) => total + units(row.quantity), 0n);
 }
 
+function sumAmounts(rows: Array<{ lineTotal: string }>): bigint {
+  return rows.reduce((total, row) => total + units(row.lineTotal), 0n);
+}
+
+function requestedLineIds(lines: Array<{ sourceLineId: string }>) {
+  const ids = new Set<string>();
+  for (const line of lines) {
+    if (ids.has(line.sourceLineId)) {
+      throw new AppError("VALIDATION_FAILED", "A return request cannot contain the same source line more than once");
+    }
+    ids.add(line.sourceLineId);
+  }
+}
+
+function allocateReturnAmount(total: bigint, quantity: bigint, remainingQuantity: bigint): bigint {
+  return quantity === remainingQuantity ? total : total * quantity / remainingQuantity;
+}
+
+function returnSnapshot(
+  sourceQuantity: string,
+  sourceSubtotal: bigint,
+  sourceTax: bigint,
+  prior: Array<{ quantity: string; lineTotal: string; taxAmount: string }>,
+  quantity: bigint,
+  requestedQuantity: string,
+) {
+  const returnedQuantity = sumQuantities(prior);
+  const remainingQuantity = units(sourceQuantity) - returnedQuantity;
+  if (quantity > remainingQuantity) {
+    throw new AppError("RETURN_QTY_EXCEEDED", "Return quantity exceeds the remaining source quantity", {
+      requested: requestedQuantity,
+      remaining: decimal(remainingQuantity),
+    });
+  }
+  const returnedGrand = sumAmounts(prior);
+  const returnedTax = prior.reduce((total, row) => total + units(row.taxAmount), 0n);
+  const remainingSubtotal = sourceSubtotal - (returnedGrand - returnedTax);
+  const remainingTax = sourceTax - returnedTax;
+  if (remainingQuantity < 0n || remainingSubtotal < 0n || remainingTax < 0n) {
+    throw new AppError("VALIDATION_FAILED", "Existing returns exceed the source line's refundable amount");
+  }
+  const subtotal = allocateReturnAmount(remainingSubtotal, quantity, remainingQuantity);
+  const tax = allocateReturnAmount(remainingTax, quantity, remainingQuantity);
+  return { subtotal, tax, total: subtotal + tax };
+}
+
 async function updateBalance(tx: Database, ctx: TenantContext, itemId: string, warehouseId: string, batchId: string | null, delta: bigint, allowNegative: boolean) {
   const batchCondition = batchId ? eq(stockBalances.batchId, batchId) : isNull(stockBalances.batchId);
   const row = await tx.select().from(stockBalances).where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, itemId), eq(stockBalances.warehouseId, warehouseId), batchCondition)).for("update");
@@ -88,8 +134,11 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
     const replay = await tx.query.returns.findFirst({ where: and(eq(returns.tenantId, ctx.tenantId), eq(returns.operationId, operationId)) });
     if (replay) return replay;
     await assertWarehouse(tx, ctx, input.warehouseId);
-    const sale = await tx.query.sales.findFirst({ where: and(eq(sales.id, input.saleId), eq(sales.tenantId, ctx.tenantId)) });
+    const [sale] = await tx.select().from(sales)
+      .where(and(eq(sales.id, input.saleId), eq(sales.tenantId, ctx.tenantId)))
+      .for("update");
     if (!sale || !sale.customerId) throw new AppError("RESOURCE_NOT_FOUND", "Sale not found or has no customer");
+    if (sale.status === "CANCELLED") throw new AppError("VALIDATION_FAILED", "A cancelled sale cannot be returned");
     // Van Sales guard (Decision VAN-012): a field sale drew from rep custody, not the
     // warehouse. Returning it through this flow would put stock back into warehouse
     // on-hand and debit Inventory 1200 for goods that never left it via this sale.
@@ -97,24 +146,33 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
     // than post wrong ledger entries.
     const fieldSaleMovement = await tx.query.repStockMovements.findFirst({ where: and(eq(repStockMovements.tenantId, ctx.tenantId), eq(repStockMovements.movementType, "SALE"), eq(repStockMovements.referenceId, sale.id)) });
     if (fieldSaleMovement) throw new AppError("VALIDATION_FAILED", "This sale was made from rep custody; use the field return flow (30 §5.3)", { saleId: sale.id });
-    const sourceLines = await tx.query.saleItems.findMany({ where: and(eq(saleItems.saleId, sale.id), eq(saleItems.tenantId, ctx.tenantId)) });
-    const selected = [] as Array<{ source: typeof sourceLines[number] & { batchId: string | null }; quantity: bigint; total: bigint; condition: "RESELLABLE" | "UNSELLABLE" }>;
+    requestedLineIds(input.lines);
+    const sourceLines = await tx.select().from(saleItems).where(and(eq(saleItems.saleId, sale.id), eq(saleItems.tenantId, ctx.tenantId))).orderBy(asc(saleItems.id)).for("update");
+    const selected = [] as Array<{ source: typeof sourceLines[number] & { batchId: string | null }; quantity: bigint; subtotal: bigint; tax: bigint; total: bigint; condition: "RESELLABLE" | "UNSELLABLE" }>;
     for (const requested of input.lines) {
       const source = sourceLines.find((line) => line.id === requested.sourceLineId);
       if (!source || source.warehouseId !== input.warehouseId) throw new AppError("RESOURCE_NOT_FOUND", "Sale line not found in the selected warehouse");
       const prior = await tx.query.returnLines.findMany({ where: and(eq(returnLines.tenantId, ctx.tenantId), eq(returnLines.saleItemId, source.id)) });
-      const remaining = units(source.quantity) - sumQuantities(prior);
       const quantity = units(requested.quantity);
-      if (quantity > remaining) throw new AppError("RETURN_QTY_EXCEEDED", "Return quantity exceeds the remaining sale quantity", { requested: requested.quantity, remaining: decimal(remaining) });
-      selected.push({ source, quantity, total: quantity * units(source.unitPrice) / scale, condition: requested.condition ?? "RESELLABLE" });
+      const snapshot = returnSnapshot(
+        source.quantity,
+        units(source.lineTotal) - units(source.taxAmount) - units(source.orderDiscountAllocation),
+        units(source.taxAmount),
+        prior,
+        quantity,
+        requested.quantity,
+      );
+      selected.push({ source, quantity, ...snapshot, condition: requested.condition ?? "RESELLABLE" });
     }
-    const total = selected.reduce((sum, line) => sum + line.total, 0n);
-    const [record] = await tx.insert(returns).values({ tenantId: ctx.tenantId, type: "CUSTOMER_RETURN", saleId: sale.id, partyId: sale.customerId, warehouseId: input.warehouseId, subtotal: decimal(total), grandTotal: decimal(total), operationId, notes: input.notes, createdBy: ctx.userId }).returning();
+    const subtotal = selected.reduce((sum, line) => sum + line.subtotal, 0n);
+    const tax = selected.reduce((sum, line) => sum + line.tax, 0n);
+    const total = subtotal + tax;
+    const [record] = await tx.insert(returns).values({ tenantId: ctx.tenantId, type: "CUSTOMER_RETURN", saleId: sale.id, partyId: sale.customerId, warehouseId: input.warehouseId, subtotal: decimal(subtotal), taxTotal: decimal(tax), grandTotal: decimal(total), operationId, notes: input.notes, createdBy: ctx.userId }).returning();
     if (!record) throw new AppError("INTERNAL_ERROR", "Unable to create customer return");
     let returnedCostUnits = 0n;
     let unsellableCostUnits = 0n; // Decision VAN-003
     for (const line of selected) {
-      await tx.insert(returnLines).values({ tenantId: ctx.tenantId, returnId: record.id, saleItemId: line.source.id, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, quantity: decimal(line.quantity), unitPrice: line.source.unitPrice, lineTotal: decimal(line.total), condition: line.condition });
+      await tx.insert(returnLines).values({ tenantId: ctx.tenantId, returnId: record.id, saleItemId: line.source.id, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, quantity: decimal(line.quantity), unitPrice: line.source.unitPrice, lineTotal: decimal(line.total), taxAmount: decimal(line.tax), condition: line.condition });
       const item = await tx.query.items.findFirst({ where: and(eq(items.id, line.source.itemId), eq(items.tenantId, ctx.tenantId)) });
       if (!item) throw new AppError("RESOURCE_NOT_FOUND", "Item not found");
       const costUnits = await lineCostUnits(tx, ctx, line.source.itemId, line.source.warehouseId, line.source.batchId);
@@ -143,7 +201,9 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
     await postCustomerReturnJournal(tx, ctx, {
       returnId: record.id,
       operationId,
-      returnedSubtotal: decimal(total),
+      returnedSubtotal: decimal(subtotal),
+      returnedTax: decimal(tax),
+      returnedGrandTotal: decimal(total),
       returnedCostTotal: decimal(returnedCostUnits),
       // No receivable found => the sale was already fully paid, so
       // this return settles as a cash refund rather than a reduction
@@ -159,7 +219,7 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
       action: "return.customer.complete",
       entityType: "RETURN",
       entityId: record.id,
-      after: { saleId: sale.id, grandTotal: decimal(total) },
+      after: { saleId: sale.id, subtotal: decimal(subtotal), taxTotal: decimal(tax), grandTotal: decimal(total) },
     });
 
     return record;
@@ -173,23 +233,32 @@ export async function completeSupplierReturn(ctx: TenantContext, input: Supplier
     await assertWarehouse(tx, ctx, input.warehouseId);
     const purchase = await tx.query.purchases.findFirst({ where: and(eq(purchases.id, input.purchaseId), eq(purchases.tenantId, ctx.tenantId)) });
     if (!purchase) throw new AppError("RESOURCE_NOT_FOUND", "Purchase not found");
-    const sourceLines = await tx.query.purchaseItems.findMany({ where: and(eq(purchaseItems.purchaseId, purchase.id), eq(purchaseItems.tenantId, ctx.tenantId)) });
-    const selected = [] as Array<{ source: typeof sourceLines[number] & { batchId: string | null }; quantity: bigint; total: bigint }>;
+    requestedLineIds(input.lines);
+    const sourceLines = await tx.select().from(purchaseItems).where(and(eq(purchaseItems.purchaseId, purchase.id), eq(purchaseItems.tenantId, ctx.tenantId))).orderBy(asc(purchaseItems.id)).for("update");
+    const selected = [] as Array<{ source: typeof sourceLines[number] & { batchId: string | null }; quantity: bigint; subtotal: bigint; tax: bigint; total: bigint }>;
     for (const requested of input.lines) {
       const source = sourceLines.find((line) => line.id === requested.sourceLineId);
       if (!source || source.warehouseId !== input.warehouseId) throw new AppError("RESOURCE_NOT_FOUND", "Purchase line not found in the selected warehouse");
       const prior = await tx.query.returnLines.findMany({ where: and(eq(returnLines.tenantId, ctx.tenantId), eq(returnLines.purchaseItemId, source.id)) });
-      const remaining = units(source.quantity) - sumQuantities(prior);
       const quantity = units(requested.quantity);
-      if (quantity > remaining) throw new AppError("RETURN_QTY_EXCEEDED", "Return quantity exceeds the remaining purchase quantity", { requested: requested.quantity, remaining: decimal(remaining) });
+      const snapshot = returnSnapshot(
+        source.quantity,
+        units(source.lineTotal) - units(source.taxAmount) - units(source.orderDiscountAllocation),
+        units(source.taxAmount),
+        prior,
+        quantity,
+        requested.quantity,
+      );
       const batch = source.batchNumber ? await tx.query.stockBatches.findFirst({ where: and(eq(stockBatches.tenantId, ctx.tenantId), eq(stockBatches.itemId, source.itemId), eq(stockBatches.batchNumber, source.batchNumber)) }) : null;
-      selected.push({ source: { ...source, batchId: batch?.id ?? null }, quantity, total: quantity * units(source.costPrice) / scale });
+      selected.push({ source: { ...source, batchId: batch?.id ?? null }, quantity, ...snapshot });
     }
-    const total = selected.reduce((sum, line) => sum + line.total, 0n);
-    const [record] = await tx.insert(returns).values({ tenantId: ctx.tenantId, type: "SUPPLIER_RETURN", purchaseId: purchase.id, partyId: purchase.supplierId, warehouseId: input.warehouseId, subtotal: decimal(total), grandTotal: decimal(total), operationId, notes: input.notes, createdBy: ctx.userId }).returning();
+    const subtotal = selected.reduce((sum, line) => sum + line.subtotal, 0n);
+    const tax = selected.reduce((sum, line) => sum + line.tax, 0n);
+    const total = subtotal + tax;
+    const [record] = await tx.insert(returns).values({ tenantId: ctx.tenantId, type: "SUPPLIER_RETURN", purchaseId: purchase.id, partyId: purchase.supplierId, warehouseId: input.warehouseId, subtotal: decimal(subtotal), taxTotal: decimal(tax), grandTotal: decimal(total), operationId, notes: input.notes, createdBy: ctx.userId }).returning();
     if (!record) throw new AppError("INTERNAL_ERROR", "Unable to create supplier return");
     for (const line of selected) {
-      await tx.insert(returnLines).values({ tenantId: ctx.tenantId, returnId: record.id, purchaseItemId: line.source.id, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, quantity: decimal(line.quantity), unitPrice: line.source.costPrice, lineTotal: decimal(line.total) });
+      await tx.insert(returnLines).values({ tenantId: ctx.tenantId, returnId: record.id, purchaseItemId: line.source.id, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, quantity: decimal(line.quantity), unitPrice: line.source.costPrice, lineTotal: decimal(line.total), taxAmount: decimal(line.tax) });
       const item = await tx.query.items.findFirst({ where: and(eq(items.id, line.source.itemId), eq(items.tenantId, ctx.tenantId)) });
       if (!item) throw new AppError("RESOURCE_NOT_FOUND", "Item not found");
       await updateBalance(tx, ctx, line.source.itemId, line.source.warehouseId, line.source.batchId, -line.quantity, item.allowNegativeStock);

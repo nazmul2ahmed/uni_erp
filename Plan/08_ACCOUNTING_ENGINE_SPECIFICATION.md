@@ -71,7 +71,7 @@ Every new tenant is seeded with this baseline chart at provisioning (`05` §49).
 | Code | Name | System | Notes |
 |---|---|---|---|
 | 2000 | Accounts Payable | ✓ | mirrors `core.payables` in aggregate |
-| 2100 | Tax Payable | | VAT/sales tax collected |
+| 2100 | Tax Payable | ✓ | system-posted VAT/sales tax collected |
 | 2200 | Accrued Expenses | | future |
 | 2300 | Customer Advances | | prepayment not yet allocated |
 
@@ -192,7 +192,21 @@ Dr  Inventory                      returnedCostTotal
     Cr  COGS                       returnedCostTotal
 ```
 
-Proportional allocation between Receivable-reduction vs Cash-refund follows the originating sale's paid/due ratio at the time of sale, unless the tenant configures return refunds as always-cash (a tenant setting, per §44 `02` distinction between rule and configuration).
+`returnedSubtotal` excludes the original line/order discounts and tax;
+`returnedTax` is reversed from the sale-line tax snapshot; and the cash or
+receivable settlement equals `returnedGrandTotal = returnedSubtotal +
+returnedTax`. Sale/purchase line snapshots persist each proportional
+order-discount allocation so partial returns do not recalculate against
+current prices or tax profiles. Partial returns allocate remaining amounts
+proportionally to remaining quantity; the last return receives any rounding
+remainder.
+
+Proportional allocation between Receivable-reduction vs Cash-refund follows
+the originating sale's paid/due ratio at the time of sale, unless the tenant
+configures return refunds as always-cash (a tenant setting, per §44 `02`
+distinction between rule and configuration). The current MVP still uses the
+existing all-cash-or-all-receivable settlement choice; the ratio/configuration
+policy remains open.
 
 ## 5.6 Supplier Return
 
@@ -200,6 +214,11 @@ Proportional allocation between Receivable-reduction vs Cash-refund follows the 
 Dr  Accounts Payable / Cash        returnedGrandTotal (mirrors 5.5 logic)
     Cr  Inventory                  returnedCostTotal
 ```
+
+For the current MVP, purchase tax is capitalized into Inventory (§5.2), so
+supplier returns reverse the original net-of-discount inventory cost plus
+its snapshotted purchase tax; both the liability/cash settlement and
+Inventory credit use that returned grand total.
 
 ## 5.7 Expense Recorded (`RecordExpenseUseCase`, `07` §14.2)
 
@@ -385,6 +404,20 @@ Per `03` §55 — MVP supports **No Tax** or **Single Tax** only.
 TaxProfile
 ├── id, tenantId, name, rate (percentage), isInclusive (boolean)
 ```
+
+**Phase 2 implementation decision — tax-exclusive:** the listed sale price
+and purchase cost are pre-tax. MVP profiles are exclusive (`isInclusive =
+false`); inclusive pricing is not active. An item may have no profile (no
+tax) or one profile (one non-compound tax). A profile's name and rate are
+immutable after creation; create a new profile to use a changed rate. Each
+purchase/sale line snapshots the profile ID, rate, and calculated tax amount
+so later item assignment changes cannot rewrite transaction history.
+
+Tax is calculated server-side to four decimal places using decimal arithmetic
+and half-up rounding at the money scale. The taxable base is the line amount
+after its line discount and a proportional allocation of any order discount.
+The sale/purchase header total is `subtotal - discountTotal + taxTotal`.
+Client-entered rates or tax amounts are never accepted.
 
 **Posting impact:**
 

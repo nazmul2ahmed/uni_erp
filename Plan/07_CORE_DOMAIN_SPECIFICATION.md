@@ -194,6 +194,7 @@ Sale
 ├── paidTotal, dueTotal: Money
 ├── saleDate
 ├── operationId
+├── line snapshots include each proportional orderDiscountAllocation
 ```
 
 ## 7.2 Value Object: `SaleLine`
@@ -203,7 +204,7 @@ SaleLine
 ├── itemId, description
 ├── quantity: Quantity
 ├── unitPrice: Money
-├── lineDiscount: Money
+├── lineDiscount, orderDiscountAllocation: Money
 ├── taxAmount: Money
 ├── lineTotal: Money (derived)
 ├── batchId? / serialId?
@@ -214,7 +215,7 @@ SaleLine
 
 ```text
 1. lineTotal = (quantity * unitPrice) - lineDiscount + taxAmount   (derived, never stored independently of inputs)
-2. grandTotal = SUM(lines.lineTotal) - discountTotal + taxTotal
+2. grandTotal = subtotal - discountTotal + taxTotal, where discountTotal includes line and order discounts. Order discounts are allocated proportionally across line taxable bases for tax calculation.
 3. paidTotal + dueTotal = grandTotal
 4. status transitions are one-directional except explicit CANCELLED path:
    DRAFT -> CONFIRMED -> {PARTIALLY_PAID -> PAID | DUE} -> COMPLETED
@@ -356,6 +357,7 @@ Purchase
 ├── pricing: { subtotal, discountTotal, taxTotal, grandTotal }
 ├── paidTotal, dueTotal
 ├── purchaseDate, operationId
+├── line snapshots include each proportional orderDiscountAllocation
 ```
 
 ## 8.2 Value Object: `PurchaseLine`
@@ -363,7 +365,7 @@ Purchase
 ```text
 PurchaseLine
 ├── itemId, description, quantity, costPrice, sellingPrice?
-├── lineDiscount, taxAmount, lineTotal
+├── lineDiscount, orderDiscountAllocation, taxAmount, lineTotal
 ├── batchNumber?, expiryDate?
 ├── warehouseId
 ```
@@ -578,12 +580,13 @@ validate(returnLine, originatingSaleLine) -> Result<void, ReturnExceededError>
 ```text
 1. BEGIN transaction
 2. Validate ReturnEligibilityPolicy for every line
-3. Persist Return + ReturnLines
-4. Post stock movements — type = CUSTOMER_RETURN, positive quantity
-5. Reduce Receivable.balance (or issue refund Payment if already fully paid)
-6. Post accounting journal (reverse portion of original sale journal)
-7. Audit log
-8. COMMIT
+3. Persist Return + ReturnLines with tax snapshots
+4. Allocate each source line's net subtotal and tax across partial returns; the last return receives rounding remainders
+5. Post stock movements — type = CUSTOMER_RETURN, positive quantity
+6. Reduce Receivable.balance (or issue refund Payment if already fully paid) by returnedGrandTotal
+7. Post accounting journal, reversing the returned net subtotal and snapshotted tax
+8. Audit log
+9. COMMIT
 ```
 
 `CompleteSupplierReturnUseCase` mirrors this against Payable/Purchase.
@@ -828,10 +831,13 @@ document must follow to register a new one.
 3. Does AdjustStockUseCase require approval workflow at MVP, or logged-only?
 4. Serial allocation UX: must user pick serial at sale time, or can
    system auto-suggest with override?
-5. Reversal journal for partial returns — one reversal per return,
-   or proportional single-line adjustment?
-6. Where does tax calculation live — Sales domain or a separate
-   shared Tax domain service consumed by both Sales and Purchase?
+5. [RESOLVED — Phase 2] Each completed return posts its own reversal
+   journal using source-line discount/tax snapshots; partial amounts
+   are allocated by remaining quantity and final rounding remainder.
+6. [RESOLVED — Phase 2] Tax calculation is a shared, server-authoritative
+   money/tax service consumed by Sales and Purchase; listed prices/costs
+   are tax-exclusive, with each line snapshotting its order-discount
+   allocation, tax rate, and tax amount. See `08` §8 and `apps/web/lib/money.ts`.
 ```
 
 ---

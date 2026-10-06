@@ -1,13 +1,28 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+
+type TaxProfile = { id: string; name: string; rate: string };
 
 export default function NewInventoryItemPage() {
   const router = useRouter();
-  const [form, setForm] = useState({ name: "", sku: "", type: "PRODUCT" });
+  const [form, setForm] = useState({ name: "", sku: "", type: "PRODUCT", taxProfileId: "" });
+  const [taxProfiles, setTaxProfiles] = useState<TaxProfile[]>([]);
+  const [loadingProfiles, setLoadingProfiles] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void fetch("/api/tax-profiles")
+      .then(async (response) => {
+        const body = await response.json();
+        if (!response.ok || !body.success) throw new Error(body.error?.message || "Unable to load tax profiles");
+        setTaxProfiles(body.data as TaxProfile[]);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : "Unable to load tax profiles"))
+      .finally(() => setLoadingProfiles(false));
+  }, []);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -21,6 +36,7 @@ export default function NewInventoryItemPage() {
           name: form.name,
           sku: form.sku || undefined,
           type: form.type,
+          taxProfileId: form.taxProfileId || undefined,
           unitId: "00000000-0000-4000-8000-000000000001",
         }),
       });
@@ -63,6 +79,19 @@ export default function NewInventoryItemPage() {
               <option value="CONSUMABLE">CONSUMABLE</option>
               <option value="RENTAL_ASSET">RENTAL_ASSET</option>
               <option value="NON_STOCK">NON_STOCK</option>
+            </select>
+          </label>
+          <label>
+            Tax profile
+            <select
+              value={form.taxProfileId}
+              onChange={(event) => setForm({ ...form, taxProfileId: event.target.value })}
+              disabled={loadingProfiles}
+            >
+              <option value="">No tax</option>
+              {taxProfiles.map((profile) => (
+                <option value={profile.id} key={profile.id}>{profile.name} ({profile.rate}%)</option>
+              ))}
             </select>
           </label>
         </div>

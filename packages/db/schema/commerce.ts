@@ -63,7 +63,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { tenants, users } from "./control";
-import { core, customers, suppliers, items } from "./core";
+import { core, customers, suppliers, items, taxProfiles } from "./core";
 
 /* ================================================================ */
 /* Branch / Warehouse — per 06 v2.0 §5.2-§5.3                         */
@@ -187,6 +187,9 @@ export const purchaseItems = core.table(
     costPrice: numeric("cost_price", { precision: 18, scale: 4 }).notNull(),
     sellingPrice: numeric("selling_price", { precision: 18, scale: 4 }),
     lineDiscount: numeric("line_discount", { precision: 18, scale: 4 }).notNull().default("0"),
+    orderDiscountAllocation: numeric("order_discount_allocation", { precision: 18, scale: 4 }).notNull().default("0"),
+    taxProfileId: uuid("tax_profile_id").references(() => taxProfiles.id, { onDelete: "set null" }),
+    taxRate: numeric("tax_rate", { precision: 9, scale: 4 }).notNull().default("0"),
     taxAmount: numeric("tax_amount", { precision: 18, scale: 4 }).notNull().default("0"),
     lineTotal: numeric("line_total", { precision: 18, scale: 4 }).notNull(),
     batchNumber: text("batch_number"),
@@ -307,10 +310,12 @@ export const sales = core.table(
     updatedBy: uuid("updated_by").references(() => users.id),
     cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
     cancelledReason: text("cancelled_reason"),
+    cancelOperationId: uuid("cancel_operation_id"),
   },
   (t) => ({
     tenantInvoiceUnique: uniqueIndex("sales_tenant_invoice_unique").on(t.tenantId, t.invoiceNumber),
     tenantOperationUnique: uniqueIndex("sales_tenant_operation_unique").on(t.tenantId, t.operationId),
+    tenantCancelOperationUnique: uniqueIndex("sales_tenant_cancel_operation_unique").on(t.tenantId, t.cancelOperationId),
     tenantCustomerIdx: index("sales_tenant_customer_idx").on(t.tenantId, t.customerId),
     tenantDateIdx: index("sales_tenant_date_idx").on(t.tenantId, t.saleDate),
     tenantStatusIdx: index("sales_tenant_status_idx").on(t.tenantId, t.status),
@@ -334,6 +339,9 @@ export const saleItems = core.table(
     quantity: numeric("quantity", { precision: 18, scale: 4 }).notNull(),
     unitPrice: numeric("unit_price", { precision: 18, scale: 4 }).notNull(),
     lineDiscount: numeric("line_discount", { precision: 18, scale: 4 }).notNull().default("0"),
+    orderDiscountAllocation: numeric("order_discount_allocation", { precision: 18, scale: 4 }).notNull().default("0"),
+    taxProfileId: uuid("tax_profile_id").references(() => taxProfiles.id, { onDelete: "set null" }),
+    taxRate: numeric("tax_rate", { precision: 9, scale: 4 }).notNull().default("0"),
     taxAmount: numeric("tax_amount", { precision: 18, scale: 4 }).notNull().default("0"),
     lineTotal: numeric("line_total", { precision: 18, scale: 4 }).notNull(),
     batchId: uuid("batch_id").references(() => stockBatches.id),
@@ -365,6 +373,7 @@ export const returns = core.table(
     warehouseId: uuid("warehouse_id").notNull().references(() => warehouses.id),
     status: text("status", { enum: ["COMPLETED", "CANCELLED"] }).notNull().default("COMPLETED"),
     subtotal: numeric("subtotal", { precision: 18, scale: 4 }).notNull(),
+    taxTotal: numeric("tax_total", { precision: 18, scale: 4 }).notNull().default("0"),
     grandTotal: numeric("grand_total", { precision: 18, scale: 4 }).notNull(),
     returnDate: timestamp("return_date", { withTimezone: true }).notNull().defaultNow(),
     operationId: uuid("operation_id").notNull(),
@@ -394,6 +403,7 @@ export const returnLines = core.table(
     quantity: numeric("quantity", { precision: 18, scale: 4 }).notNull(),
     unitPrice: numeric("unit_price", { precision: 18, scale: 4 }).notNull(),
     lineTotal: numeric("line_total", { precision: 18, scale: 4 }).notNull(),
+    taxAmount: numeric("tax_amount", { precision: 18, scale: 4 }).notNull().default("0"),
     // Decision VAN-003 (30_MODULE_VAN_SALES.md §5.2) — a Core Return-
     // domain extension discovered via Van Sales analysis but applicable
     // platform-wide: a returned unit is not always resellable (broken/
@@ -600,7 +610,7 @@ export const receivables = core.table(
     amount: numeric("amount", { precision: 18, scale: 4 }).notNull(),
     paidAmount: numeric("paid_amount", { precision: 18, scale: 4 }).notNull().default("0"),
     balance: numeric("balance", { precision: 18, scale: 4 }).notNull(), // derived, recomputed on allocation
-    status: text("status", { enum: ["OPEN", "PARTIAL", "SETTLED"] })
+    status: text("status", { enum: ["OPEN", "PARTIAL", "SETTLED", "CANCELLED"] })
       .notNull()
       .default("OPEN"),
     dueDate: date("due_date"),

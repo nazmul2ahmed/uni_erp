@@ -163,13 +163,26 @@ Phase 1 code from starting.
 **Phase 2 exit criteria:**
 
 ```text
-[ ] Financial Testing Matrix (24 §3) passes in full
+[ ] All Phase 2-owned rows in the Financial Testing Matrix (24 §3) pass
 [ ] Inventory Testing Matrix (24 §4) passes for FIFO (batch/serial/
     FEFO deferred to their owning phase, §5)
 [ ] A tenant can complete: Purchase -> Stock -> POS Sale -> Payment
     -> Customer Due -> Basic P&L, entirely through the UI (03 §84's
     MVP Definition, now testable end-to-end)
+[ ] Customer and supplier returns reverse historical discounts/tax and
+    preserve partial-return rounding; sale cancellation behavior for
+    already received/allocated payments is explicitly decided and tested
 ```
+
+**Financial-matrix phase boundary:** `24` §3 is a full-platform release
+matrix, not a requirement to build Phase 3 accounting controls inside Phase 2.
+The Phase 2 gate covers the sale, purchase, payment, return, idempotency, and
+posting invariants for Phase 2 use cases. Opening entries, period close, and
+manual journal adjustments are Phase 3 gates, alongside the Phase 3 accounting
+depth scope below. Tax remains in the Phase 2 gate under `08` §8; its
+tax-exclusive profile/pricing behavior and return reversals are implemented
+locally. Sale cancellation/payment settlement policy remains a Phase 2 blocker
+until explicitly decided and tested.
 
 ## Phase 3 — Accounting Depth
 
@@ -177,6 +190,7 @@ Phase 1 code from starting.
 Already largely built AS PART OF Phase 2 (per Phase 2's note above
 that Accounting cannot trail Sales/Purchase). This phase's REMAINING
 scope, per 08:
+  Opening entries (08 §5.8)
   Period Closing (08 §9)
   Manual Journal Adjustments (08 §10.2)
   Trial Balance / P&L / Balance Sheet / Cash Flow report UI (08 §6,

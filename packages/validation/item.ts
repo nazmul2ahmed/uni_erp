@@ -47,6 +47,7 @@ const itemBaseObjectSchema = z.object({
   serialTracked: z.boolean().default(false),
   rentalTracked: z.boolean().default(false),
   warrantyTracked: z.boolean().default(false),
+  taxProfileId: idSchema.nullable().optional(),
 });
 
 export const createItemSchema = itemBaseObjectSchema

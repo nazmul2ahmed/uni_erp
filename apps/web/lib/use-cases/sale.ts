@@ -1,28 +1,36 @@
 import { and, asc, desc, eq, gte, ilike, isNull, lte } from "drizzle-orm";
 import {
   businessProfiles,
+  accounts,
   customers,
   items,
+  journalEntries,
+  journals,
   paymentAllocations,
   payments,
   receivables,
+  repStockMovements,
+  returns,
   saleItems,
   sales,
   stockBalances,
   stockBatches,
   stockSerials,
   stockMovements,
+  taxProfiles,
   branches,
   warehouses,
   withTenantTransaction,
 } from "@erp/db";
 import { AppError } from "@erp/shared";
 import type { CreateSaleInput, SearchSalesQuery } from "@erp/validation";
+import type { CancelSaleInput } from "@erp/validation";
 import type { Database } from "@erp/db";
 import type { TenantContext } from "../guard";
 import { hasPermission } from "../guard";
-import { postSaleJournal } from "../accounting";
+import { deterministicSubOperationId, postCustomerSaleRefundJournal, postReversalJournal, postSaleJournal } from "../accounting";
 import { recordAudit } from "../audit";
+import { allocateProportionally, decimalToUnits, moneyScale, multiplyToMoneyUnits, taxForAmount, unitsToDecimal } from "../money";
 import { assertCustodyAvailability, custodyUnitCostUnits, postFieldSaleLine, resolveFieldSale } from "./field-sale";
 
 /**
@@ -120,22 +128,12 @@ function checkDiscountCeiling(discountPercentUnits: bigint, ceilingPercent: numb
   });
 }
 
-const moneyScale = 10000n;
-
-function decimalToUnits(value: string): bigint {
-  const [whole, fraction = ""] = value.split(".");
-  return BigInt(whole ?? "0") * moneyScale + BigInt(fraction.padEnd(4, "0").slice(0, 4));
-}
-
-function unitsToDecimal(value: bigint): string {
-  const absolute = value < 0n ? -value : value;
-  const whole = absolute / moneyScale;
-  const fraction = (absolute % moneyScale).toString().padStart(4, "0").replace(/0+$/, "");
-  return `${value < 0n ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
-}
-
 function saleNumber(): string {
   return `INV-${new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14)}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
+}
+
+function signedDecimalToUnits(value: string): bigint {
+  return value.startsWith("-") ? -decimalToUnits(value.slice(1)) : decimalToUnits(value);
 }
 
 async function assertReferences(tx: Database, ctx: TenantContext, input: CreateSaleInput) {
@@ -177,11 +175,35 @@ export async function completeSale(ctx: TenantContext, input: CreateSaleInput, o
     const maxDiscountPercent = resolveDiscountCeiling(profile?.settingsJson ?? "{}", ctx.roleKey);
     let discountOverrideApplied = false;
 
-    const computedLines = [] as Array<{ input: CreateSaleInput["lines"][number]; item: typeof items.$inferSelect; lineTotal: string }>;
+    const taxProfileRows = await tx.query.taxProfiles.findMany({
+      where: eq(taxProfiles.tenantId, ctx.tenantId),
+    });
+    const taxProfileById = new Map(taxProfileRows.map((taxProfile) => [taxProfile.id, taxProfile]));
+    const computedLines: Array<{
+      input: CreateSaleInput["lines"][number];
+      item: typeof items.$inferSelect;
+      subtotalUnits: bigint;
+      lineDiscountUnits: bigint;
+      orderDiscountUnits: bigint;
+      taxProfileId: string | null;
+      taxRate: string;
+      taxAmountUnits: bigint;
+      lineTotalUnits: bigint;
+    }> = [];
+    const batchMap = new Map<string, typeof stockBatches.$inferSelect>();
     for (const line of input.lines) {
       const item = itemMap.get(line.itemId)!;
+      const taxProfile = item.taxProfileId ? taxProfileById.get(item.taxProfileId) : undefined;
+      if (item.taxProfileId && !taxProfile) {
+        throw new AppError("VALIDATION_FAILED", `${item.name} tax profile is unavailable for this tenant`);
+      }
+      if (taxProfile?.isInclusive) {
+        throw new AppError("VALIDATION_FAILED", `${item.name} uses an unsupported tax-inclusive profile`);
+      }
       if (line.unitPrice !== item.sellingPrice) throw new AppError("VALIDATION_FAILED", `${item.name} price is no longer current`, { itemId: item.id });
-      if ((item.batchTracked || item.expiryTracked) && !line.batchId) throw new AppError("VALIDATION_FAILED", `${item.name} requires a batch`);
+      const autoFifo = !fieldSale && item.batchTracked && !item.expiryTracked && !item.serialTracked;
+      if (autoFifo && line.batchId) throw new AppError("VALIDATION_FAILED", `${item.name} batches are allocated automatically using FIFO`);
+      if ((item.batchTracked || item.expiryTracked) && !autoFifo && !line.batchId) throw new AppError("VALIDATION_FAILED", `${item.name} requires a batch`);
       if (!item.batchTracked && line.batchId) throw new AppError("VALIDATION_FAILED", `${item.name} does not accept a batch`);
       if (item.serialTracked && !line.serialId) throw new AppError("VALIDATION_FAILED", `${item.name} requires a serial`);
       if (!item.serialTracked && line.serialId) throw new AppError("VALIDATION_FAILED", `${item.name} does not accept a serial`);
@@ -189,29 +211,52 @@ export async function completeSale(ctx: TenantContext, input: CreateSaleInput, o
         const batch = await tx.query.stockBatches.findFirst({ where: and(eq(stockBatches.id, line.batchId), eq(stockBatches.tenantId, ctx.tenantId), eq(stockBatches.itemId, item.id)) });
         if (!batch) throw new AppError("RESOURCE_NOT_FOUND", `${item.name} batch not found`);
         if (item.expiryTracked && batch.expiryDate && batch.expiryDate < new Date().toISOString().slice(0, 10)) throw new AppError("VALIDATION_FAILED", `${item.name} batch is expired`, { itemId: item.id, batchId: batch.id });
+        batchMap.set(batch.id, batch);
       }
       if (line.serialId) {
         const serial = await tx.query.stockSerials.findFirst({ where: and(eq(stockSerials.id, line.serialId), eq(stockSerials.tenantId, ctx.tenantId), eq(stockSerials.itemId, item.id), eq(stockSerials.status, "IN_STOCK")) });
         if (!serial) throw new AppError("VALIDATION_FAILED", `${item.name} serial is unavailable`, { itemId: item.id, serialId: line.serialId });
       }
-      const lineSubtotalUnits = decimalToUnits(line.quantity) * decimalToUnits(item.sellingPrice) / moneyScale;
+      const lineSubtotalUnits = multiplyToMoneyUnits(decimalToUnits(line.quantity), decimalToUnits(item.sellingPrice));
       const lineDiscountUnits = decimalToUnits(line.lineDiscount);
-      const lineTotalUnits = lineSubtotalUnits - lineDiscountUnits;
-      if (lineTotalUnits < 0n) throw new AppError("VALIDATION_FAILED", "Line discount cannot exceed line value", { itemId: item.id });
+      if (lineSubtotalUnits - lineDiscountUnits < 0n) throw new AppError("VALIDATION_FAILED", "Line discount cannot exceed line value", { itemId: item.id });
       if (lineDiscountUnits > 0n && lineSubtotalUnits > 0n) {
         const linePercentHundredths = (lineDiscountUnits * 10000n) / lineSubtotalUnits; // percent * 100
         const result = checkDiscountCeiling(linePercentHundredths, maxDiscountPercent, ctx, `${item.name} line`);
         if (result.overrideUsed) discountOverrideApplied = true;
       }
-      computedLines.push({ input: line, item, lineTotal: unitsToDecimal(lineTotalUnits) });
+      computedLines.push({
+        input: line,
+        item,
+        subtotalUnits: lineSubtotalUnits,
+        lineDiscountUnits,
+        orderDiscountUnits: 0n,
+        taxProfileId: taxProfile?.id ?? null,
+        taxRate: taxProfile?.rate ?? "0",
+        taxAmountUnits: 0n,
+        lineTotalUnits: 0n,
+      });
     }
 
-    const subtotalUnits = computedLines.reduce((sum, entry) => sum + decimalToUnits(entry.input.quantity) * decimalToUnits(entry.item.sellingPrice) / moneyScale, 0n);
+    const subtotalUnits = computedLines.reduce((sum, entry) => sum + entry.subtotalUnits, 0n);
     const orderDiscountUnits = decimalToUnits(input.orderDiscount);
-    const discountUnits = computedLines.reduce((sum, entry) => sum + decimalToUnits(entry.input.lineDiscount), 0n) + orderDiscountUnits;
-    const grandTotalUnits = subtotalUnits - discountUnits;
+    const lineDiscountUnits = computedLines.reduce((sum, entry) => sum + entry.lineDiscountUnits, 0n);
+    const discountUnits = lineDiscountUnits + orderDiscountUnits;
+    if (subtotalUnits - discountUnits < 0n) throw new AppError("VALIDATION_FAILED", "Discounts cannot exceed the sale subtotal");
+    const orderDiscountAllocations = allocateProportionally(
+      orderDiscountUnits,
+      computedLines.map((entry) => entry.subtotalUnits - entry.lineDiscountUnits),
+    );
+    let taxTotalUnits = 0n;
+    for (const [index, entry] of computedLines.entries()) {
+      entry.orderDiscountUnits = orderDiscountAllocations[index]!;
+      const taxableUnits = entry.subtotalUnits - entry.lineDiscountUnits - entry.orderDiscountUnits;
+      entry.taxAmountUnits = taxForAmount(taxableUnits, entry.taxRate);
+      entry.lineTotalUnits = entry.subtotalUnits - entry.lineDiscountUnits + entry.taxAmountUnits;
+      taxTotalUnits += entry.taxAmountUnits;
+    }
+    const grandTotalUnits = subtotalUnits - discountUnits + taxTotalUnits;
     const paidUnits = decimalToUnits(input.cashReceived);
-    if (grandTotalUnits < 0n) throw new AppError("VALIDATION_FAILED", "Discounts cannot exceed the sale subtotal");
     if (paidUnits > grandTotalUnits) throw new AppError("VALIDATION_FAILED", "Payment cannot exceed the sale total");
     if (!input.customerId && paidUnits !== grandTotalUnits) throw new AppError("VALIDATION_FAILED", "A walk-in sale must be paid in full");
 
@@ -228,45 +273,157 @@ export async function completeSale(ctx: TenantContext, input: CreateSaleInput, o
     // Hook 4.5b: availability is checked against the rep's custody, not the warehouse.
     if (fieldSale) await assertCustodyAvailability(tx, ctx, fieldSale, computedLines);
 
-    for (const entry of computedLines) {
-      if (fieldSale) break;
-      if (!entry.item.stockTracked) continue;
-      const batchCondition = entry.input.batchId ? eq(stockBalances.batchId, entry.input.batchId) : isNull(stockBalances.batchId);
-      const balances = await tx.select().from(stockBalances).where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, entry.item.id), eq(stockBalances.warehouseId, entry.input.warehouseId), batchCondition)).for("update");
+    const stockRequests = new Map<string, {
+      item: typeof items.$inferSelect;
+      warehouseId: string;
+      batchId: string | null;
+      requestedUnits: bigint;
+      allocation: "FIFO" | "FIXED";
+    }>();
+    if (!fieldSale) {
+      for (const entry of computedLines) {
+        if (!entry.item.stockTracked) continue;
+        const allocation = entry.item.batchTracked && !entry.item.expiryTracked && !entry.item.serialTracked ? "FIFO" : "FIXED";
+        const batchId = allocation === "FIFO" ? null : entry.input.batchId ?? null;
+        const key = JSON.stringify([entry.item.id, entry.input.warehouseId, allocation, batchId]);
+        const existing = stockRequests.get(key);
+        if (existing) {
+          existing.requestedUnits += decimalToUnits(entry.input.quantity);
+        } else {
+          stockRequests.set(key, {
+            item: entry.item,
+            warehouseId: entry.input.warehouseId,
+            batchId,
+            requestedUnits: decimalToUnits(entry.input.quantity),
+            allocation,
+          });
+        }
+      }
+    }
+
+    // Lock every distinct balance in the same order across multi-line sales.
+    const orderedStockRequests = [...stockRequests.values()].sort((a, b) =>
+      a.item.id.localeCompare(b.item.id)
+      || a.warehouseId.localeCompare(b.warehouseId)
+      || (a.batchId ?? "").localeCompare(b.batchId ?? ""),
+    );
+    const fifoBalances = new Map<string, Array<{ batchId: string; availableUnits: bigint }>>();
+    for (const request of orderedStockRequests) {
+      if (request.allocation === "FIFO") {
+        const batches = await tx.query.stockBatches.findMany({
+          where: and(eq(stockBatches.tenantId, ctx.tenantId), eq(stockBatches.itemId, request.item.id)),
+          orderBy: [asc(stockBatches.receivedAt), asc(stockBatches.id)],
+        });
+        for (const batch of batches) batchMap.set(batch.id, batch);
+        const balances = await tx.select().from(stockBalances)
+          .where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, request.item.id), eq(stockBalances.warehouseId, request.warehouseId)))
+          .orderBy(asc(stockBalances.batchId))
+          .for("update");
+        const balanceByBatch = new Map(balances.filter((balance) => balance.batchId).map((balance) => [balance.batchId!, balance]));
+        const availableByBatch = batches.flatMap((batch) => {
+          const balance = balanceByBatch.get(batch.id);
+          const availableUnits = decimalToUnits(balance?.quantityOnHand ?? "0") - decimalToUnits(balance?.quantityReserved ?? "0");
+          return availableUnits > 0n ? [{ batchId: batch.id, availableUnits }] : [];
+        });
+        const availableUnits = availableByBatch.reduce((sum, batch) => sum + batch.availableUnits, 0n);
+        if (availableUnits < request.requestedUnits) throw new AppError("INSUFFICIENT_STOCK", `Insufficient stock for ${request.item.name}`, { itemId: request.item.id, available: unitsToDecimal(availableUnits), requested: unitsToDecimal(request.requestedUnits) });
+        fifoBalances.set(JSON.stringify([request.item.id, request.warehouseId]), availableByBatch);
+        continue;
+      }
+      const batchCondition = request.batchId ? eq(stockBalances.batchId, request.batchId) : isNull(stockBalances.batchId);
+      const balances = await tx.select().from(stockBalances).where(and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, request.item.id), eq(stockBalances.warehouseId, request.warehouseId), batchCondition)).for("update");
       const balance = balances[0];
       const availableUnits = decimalToUnits(balance?.quantityOnHand ?? "0") - decimalToUnits(balance?.quantityReserved ?? "0");
-      const requestedUnits = decimalToUnits(entry.input.quantity);
-      if (!entry.item.allowNegativeStock && availableUnits < requestedUnits) throw new AppError("VALIDATION_FAILED", `Insufficient stock for ${entry.item.name}`, { itemId: entry.item.id, batchId: entry.input.batchId ?? null, available: unitsToDecimal(availableUnits), requested: entry.input.quantity });
+      if (!request.item.allowNegativeStock && availableUnits < request.requestedUnits) throw new AppError("INSUFFICIENT_STOCK", `Insufficient stock for ${request.item.name}`, { itemId: request.item.id, batchId: request.batchId, available: unitsToDecimal(availableUnits), requested: unitsToDecimal(request.requestedUnits) });
+    }
+
+    const fifoRemaining = new Map<string, bigint>();
+    for (const [key, balances] of fifoBalances) for (const balance of balances) fifoRemaining.set(`${key}:${balance.batchId}`, balance.availableUnits);
+    const postedLines: typeof computedLines = [];
+    for (const entry of computedLines) {
+      const autoFifo = !fieldSale && entry.item.stockTracked && entry.item.batchTracked && !entry.item.expiryTracked && !entry.item.serialTracked;
+      if (!autoFifo) {
+        postedLines.push(entry);
+        continue;
+      }
+      const groupKey = JSON.stringify([entry.item.id, entry.input.warehouseId]);
+      const batches = fifoBalances.get(groupKey) ?? [];
+      const quantityUnits = decimalToUnits(entry.input.quantity);
+      const originalSubtotalUnits = entry.subtotalUnits;
+      const originalDiscountUnits = entry.lineDiscountUnits;
+      const originalOrderDiscountUnits = entry.orderDiscountUnits;
+      const originalTaxUnits = entry.taxAmountUnits;
+      let remainingUnits = quantityUnits;
+      let remainingSubtotalUnits = originalSubtotalUnits;
+      let remainingDiscountUnits = originalDiscountUnits;
+      let remainingOrderDiscountUnits = originalOrderDiscountUnits;
+      let remainingTaxUnits = originalTaxUnits;
+      const allocations: Array<{ batchId: string; quantityUnits: bigint; subtotalUnits: bigint; discountUnits: bigint; orderDiscountUnits: bigint; taxAmountUnits: bigint }> = [];
+      for (const batch of batches) {
+        if (remainingUnits <= 0n) break;
+        const key = `${groupKey}:${batch.batchId}`;
+        const availableUnits = fifoRemaining.get(key) ?? 0n;
+        const allocatedUnits = availableUnits < remainingUnits ? availableUnits : remainingUnits;
+        if (allocatedUnits <= 0n) continue;
+        const lastAllocation = allocatedUnits === remainingUnits;
+        const subtotalUnits = lastAllocation ? remainingSubtotalUnits : originalSubtotalUnits * allocatedUnits / quantityUnits;
+        const discountUnits = lastAllocation ? remainingDiscountUnits : originalDiscountUnits * allocatedUnits / quantityUnits;
+        const orderDiscountUnits = lastAllocation ? remainingOrderDiscountUnits : originalOrderDiscountUnits * allocatedUnits / quantityUnits;
+        const taxAmountUnits = lastAllocation ? remainingTaxUnits : originalTaxUnits * allocatedUnits / quantityUnits;
+        allocations.push({ batchId: batch.batchId, quantityUnits: allocatedUnits, subtotalUnits, discountUnits, orderDiscountUnits, taxAmountUnits });
+        fifoRemaining.set(key, availableUnits - allocatedUnits);
+        remainingUnits -= allocatedUnits;
+        remainingSubtotalUnits -= subtotalUnits;
+        remainingDiscountUnits -= discountUnits;
+        remainingOrderDiscountUnits -= orderDiscountUnits;
+        remainingTaxUnits -= taxAmountUnits;
+      }
+      if (remainingUnits > 0n) throw new AppError("INSUFFICIENT_STOCK", `Insufficient stock for ${entry.item.name}`, { itemId: entry.item.id, requested: entry.input.quantity });
+      for (const allocation of allocations) {
+        postedLines.push({
+          ...entry,
+          input: {
+            ...entry.input,
+            quantity: unitsToDecimal(allocation.quantityUnits),
+            lineDiscount: unitsToDecimal(allocation.discountUnits),
+            batchId: allocation.batchId,
+          },
+          orderDiscountUnits: allocation.orderDiscountUnits,
+          taxAmountUnits: allocation.taxAmountUnits,
+          lineTotalUnits: allocation.subtotalUnits - allocation.discountUnits + allocation.taxAmountUnits,
+        });
+      }
     }
 
     const status = paidUnits === grandTotalUnits ? "PAID" : paidUnits > 0n ? "PARTIALLY_PAID" : "DUE";
-    const [sale] = await tx.insert(sales).values({ tenantId: ctx.tenantId, branchId: input.branchId, invoiceNumber: saleNumber(), customerId: input.customerId ?? null, status, subtotal: unitsToDecimal(subtotalUnits), discountTotal: unitsToDecimal(discountUnits), taxTotal: "0", grandTotal: unitsToDecimal(grandTotalUnits), paidTotal: unitsToDecimal(paidUnits), dueTotal: unitsToDecimal(grandTotalUnits - paidUnits), saleDate: input.saleDate ? new Date(input.saleDate) : new Date(), operationId, createdBy: ctx.userId }).returning();
+    const [sale] = await tx.insert(sales).values({ tenantId: ctx.tenantId, branchId: input.branchId, invoiceNumber: saleNumber(), customerId: input.customerId ?? null, status, subtotal: unitsToDecimal(subtotalUnits), discountTotal: unitsToDecimal(discountUnits), taxTotal: unitsToDecimal(taxTotalUnits), grandTotal: unitsToDecimal(grandTotalUnits), paidTotal: unitsToDecimal(paidUnits), dueTotal: unitsToDecimal(grandTotalUnits - paidUnits), saleDate: input.saleDate ? new Date(input.saleDate) : new Date(), operationId, createdBy: ctx.userId }).returning();
     if (!sale) throw new AppError("INTERNAL_ERROR", "Unable to create sale");
 
     let costOfLinesUnits = 0n;
-    for (const entry of computedLines) {
-      await tx.insert(saleItems).values({ tenantId: ctx.tenantId, saleId: sale.id, itemId: entry.item.id, description: entry.input.description, quantity: entry.input.quantity, unitPrice: entry.item.sellingPrice, lineDiscount: entry.input.lineDiscount, taxAmount: "0", lineTotal: entry.lineTotal, batchId: entry.input.batchId, serialId: entry.input.serialId, warehouseId: entry.input.warehouseId });
+    for (const entry of postedLines) {
+      const [saleLine] = await tx.insert(saleItems).values({ tenantId: ctx.tenantId, saleId: sale.id, itemId: entry.item.id, description: entry.input.description, quantity: entry.input.quantity, unitPrice: entry.item.sellingPrice, lineDiscount: entry.input.lineDiscount, orderDiscountAllocation: unitsToDecimal(entry.orderDiscountUnits), taxProfileId: entry.taxProfileId, taxRate: entry.taxRate, taxAmount: unitsToDecimal(entry.taxAmountUnits), lineTotal: unitsToDecimal(entry.lineTotalUnits), batchId: entry.input.batchId, serialId: entry.input.serialId, warehouseId: entry.input.warehouseId }).returning({ id: saleItems.id });
+      if (!saleLine) throw new AppError("INTERNAL_ERROR", "Unable to create sale line");
+      if (entry.input.serialId) {
+        const [serial] = await tx.update(stockSerials)
+          .set({ status: "SOLD", saleItemId: saleLine.id, updatedAt: new Date() })
+          .where(and(eq(stockSerials.id, entry.input.serialId), eq(stockSerials.tenantId, ctx.tenantId), eq(stockSerials.status, "IN_STOCK")))
+          .returning({ id: stockSerials.id });
+        if (!serial) throw new AppError("VALIDATION_FAILED", "Serial is no longer available for this sale", { serialId: entry.input.serialId });
+      }
       if (!entry.item.stockTracked) continue;
       const batchCondition = entry.input.batchId ? eq(stockBalances.batchId, entry.input.batchId) : isNull(stockBalances.batchId);
       const balance = await tx.query.stockBalances.findFirst({ where: and(eq(stockBalances.tenantId, ctx.tenantId), eq(stockBalances.itemId, entry.item.id), eq(stockBalances.warehouseId, entry.input.warehouseId), batchCondition) });
       const requestedUnits = decimalToUnits(entry.input.quantity);
-      // COGS costing per 09 §6.1/§6.3: use the tracked weighted-average
-      // cost when present (kept current by receivePurchase's balance
-      // update, per 09 §6.1 Decision INV-002), falling back to the
-      // item's current purchasePrice for a balance row that predates
-      // WAC tracking or was never purchased through this system
-      // (e.g. an opening-stock item). This is a documented
-      // approximation, not full per-batch specific-identification
-      // costing (09 §6.1's batch/serial path) -- flagged in the
-      // accompanying review report, not silently upgraded here since
-      // that would require reading entry.input.batchId's own
-      // stock_batches.cost_price, a larger change than this
-      // reconciliation pass's Finding A/B scope.
+      // Batch-valued stock uses the consumed batch's specific cost; other
+      // stock uses WAC, falling back to the item's purchase price for
+      // opening balances without a recorded WAC.
       // Decision VAN-014: a field sale relieves 1250 at the cost recorded when the goods were
       // issued to the rep, NOT the warehouse's current WAC -- otherwise 1250 would not net to zero.
       const costPriceUnits = fieldSale
         ? await custodyUnitCostUnits(tx, ctx, fieldSale.assignment.id, entry.item.id, entry.input.batchId)
-        : balance?.weightedAvgCost ? decimalToUnits(balance.weightedAvgCost) : decimalToUnits(entry.item.purchasePrice);
+        : entry.input.batchId && batchMap.get(entry.input.batchId)
+          ? decimalToUnits(batchMap.get(entry.input.batchId)!.costPrice)
+          : balance?.weightedAvgCost ? decimalToUnits(balance.weightedAvgCost) : decimalToUnits(entry.item.purchasePrice);
       costOfLinesUnits += (costPriceUnits * requestedUnits) / moneyScale;
       if (fieldSale) {
         // Step 7, field-sale branch (Decision VAN-012): custody ledger only.
@@ -309,6 +466,334 @@ export async function completeSale(ctx: TenantContext, input: CreateSaleInput, o
     });
 
     return sale;
+  });
+}
+
+export async function cancelSale(ctx: TenantContext, id: string, input: CancelSaleInput, operationId: string) {
+  return withTenantTransaction(ctx.tenantId, async (tx) => {
+    const priorOperation = await tx.query.sales.findFirst({
+      where: and(eq(sales.tenantId, ctx.tenantId), eq(sales.cancelOperationId, operationId)),
+    });
+    if (priorOperation && priorOperation.id !== id) {
+      throw new AppError("VALIDATION_FAILED", "Idempotency-Key has already been used for another sale cancellation");
+    }
+
+    const [sale] = await tx.select().from(sales)
+      .where(and(eq(sales.id, id), eq(sales.tenantId, ctx.tenantId)))
+      .for("update");
+    if (!sale) throw new AppError("RESOURCE_NOT_FOUND", "Sale not found");
+    if (sale.status === "CANCELLED") {
+      if (sale.cancelOperationId === operationId) return sale;
+      throw new AppError("VALIDATION_FAILED", "Sale has already been cancelled");
+    }
+    if (!["DUE", "PARTIALLY_PAID", "PAID", "COMPLETED"].includes(sale.status)) {
+      throw new AppError("VALIDATION_FAILED", "Only a completed sale can be cancelled");
+    }
+
+    const fieldSale = await tx.query.repStockMovements.findFirst({
+      where: and(
+        eq(repStockMovements.tenantId, ctx.tenantId),
+        eq(repStockMovements.movementType, "SALE"),
+        eq(repStockMovements.referenceType, "SALE"),
+        eq(repStockMovements.referenceId, sale.id),
+      ),
+    });
+    if (fieldSale) {
+      throw new AppError("VALIDATION_FAILED", "Field sales cannot be cancelled through the warehouse sale flow");
+    }
+
+    const priorReturns = await tx.query.returns.findFirst({
+      where: and(
+        eq(returns.tenantId, ctx.tenantId),
+        eq(returns.saleId, sale.id),
+        eq(returns.type, "CUSTOMER_RETURN"),
+        eq(returns.status, "COMPLETED"),
+      ),
+    });
+    if (priorReturns) {
+      throw new AppError("VALIDATION_FAILED", "A sale with completed returns cannot be cancelled");
+    }
+
+    const saleLines = await tx.select().from(saleItems)
+      .where(and(eq(saleItems.tenantId, ctx.tenantId), eq(saleItems.saleId, sale.id)))
+      .orderBy(asc(saleItems.id))
+      .for("update");
+    const movements = await tx.select().from(stockMovements)
+      .where(and(
+        eq(stockMovements.tenantId, ctx.tenantId),
+        eq(stockMovements.movementType, "SALE"),
+        eq(stockMovements.referenceType, "SALE"),
+        eq(stockMovements.referenceId, sale.id),
+      ))
+      .orderBy(asc(stockMovements.itemId), asc(stockMovements.warehouseId), asc(stockMovements.batchId), asc(stockMovements.id));
+
+    const movementGroups = new Map<string, typeof movements>();
+    for (const movement of movements) {
+      const key = `${movement.itemId}:${movement.warehouseId}:${movement.batchId ?? ""}`;
+      movementGroups.set(key, [...(movementGroups.get(key) ?? []), movement]);
+    }
+    for (const group of movementGroups.values()) {
+      const first = group[0]!;
+      const batchCondition = first.batchId ? eq(stockBalances.batchId, first.batchId) : isNull(stockBalances.batchId);
+      const balanceRows = await tx.select().from(stockBalances)
+        .where(and(
+          eq(stockBalances.tenantId, ctx.tenantId),
+          eq(stockBalances.itemId, first.itemId),
+          eq(stockBalances.warehouseId, first.warehouseId),
+          batchCondition,
+        ))
+        .for("update");
+      const balance = balanceRows[0];
+      const restoreUnits = group.reduce((sum, movement) => {
+        const quantity = signedDecimalToUnits(movement.quantity);
+        if (quantity >= 0n) throw new AppError("INTERNAL_ERROR", "Sale stock movement has an invalid quantity");
+        return sum - quantity;
+      }, 0n);
+      if (balance) {
+        await tx.update(stockBalances)
+          .set({ quantityOnHand: unitsToDecimal(decimalToUnits(balance.quantityOnHand) + restoreUnits), updatedAt: new Date() })
+          .where(and(
+            eq(stockBalances.tenantId, ctx.tenantId),
+            eq(stockBalances.itemId, first.itemId),
+            eq(stockBalances.warehouseId, first.warehouseId),
+            batchCondition,
+          ));
+      } else {
+        await tx.insert(stockBalances).values({
+          tenantId: ctx.tenantId,
+          itemId: first.itemId,
+          warehouseId: first.warehouseId,
+          batchId: first.batchId,
+          quantityOnHand: unitsToDecimal(restoreUnits),
+          weightedAvgCost: null,
+        });
+      }
+      for (const movement of group) {
+        await tx.insert(stockMovements).values({
+          tenantId: ctx.tenantId,
+          itemId: movement.itemId,
+          warehouseId: movement.warehouseId,
+          batchId: movement.batchId,
+          serialId: movement.serialId,
+          movementType: "ADJUSTMENT_IN",
+          quantity: unitsToDecimal(-signedDecimalToUnits(movement.quantity)),
+          referenceType: "SALE_CANCELLED",
+          referenceId: sale.id,
+          operationId: deterministicSubOperationId(operationId, `stock:${movement.id}`),
+          createdBy: ctx.userId,
+        });
+      }
+    }
+
+    for (const line of saleLines) {
+      if (!line.serialId) continue;
+      const serialRows = await tx.select().from(stockSerials)
+        .where(and(eq(stockSerials.id, line.serialId), eq(stockSerials.tenantId, ctx.tenantId)))
+        .for("update");
+      const serial = serialRows[0];
+      if (!serial) throw new AppError("INTERNAL_ERROR", "Sale serial record is missing");
+      if (serial.status === "SOLD" && serial.saleItemId === line.id) {
+        await tx.update(stockSerials)
+          .set({ status: "IN_STOCK", saleItemId: null, updatedAt: new Date() })
+          .where(and(eq(stockSerials.id, serial.id), eq(stockSerials.tenantId, ctx.tenantId)));
+      } else if (serial.status !== "IN_STOCK" || serial.saleItemId !== null) {
+        throw new AppError("VALIDATION_FAILED", "A sale serial is no longer available to restore", { serialId: line.serialId });
+      }
+    }
+
+    const originalJournals = await tx.query.journals.findMany({
+      where: and(
+        eq(journals.tenantId, ctx.tenantId),
+        eq(journals.referenceType, "SALE"),
+        eq(journals.referenceId, sale.id),
+      ),
+    });
+    const revenueJournals = originalJournals.filter((journal) => journal.description === "Sale revenue recognition");
+    const cogsJournals = originalJournals.filter((journal) => journal.description === "Sale cost of goods sold");
+    if (revenueJournals.length !== 1 || cogsJournals.length > 1) {
+      throw new AppError("INTERNAL_ERROR", "Sale accounting journals are missing or ambiguous");
+    }
+
+    const revenueJournal = revenueJournals[0]!;
+    const revenueEntries = await tx.select({ code: accounts.code, debit: journalEntries.debit })
+      .from(journalEntries)
+      .innerJoin(accounts, eq(accounts.id, journalEntries.accountId))
+      .where(and(eq(journalEntries.tenantId, ctx.tenantId), eq(journalEntries.journalId, revenueJournal.id)));
+    const initialRefundMethods = revenueEntries
+      .filter((entry) => (entry.code === "1000" || entry.code === "1010") && decimalToUnits(entry.debit) > 0n)
+      .map((entry) => ({
+        method: entry.code === "1000" ? "CASH" as const : "BANK" as const,
+        amount: decimalToUnits(entry.debit),
+      }));
+    const initialPaidUnits = initialRefundMethods.reduce((sum, entry) => sum + entry.amount, 0n);
+
+    const allocationRows = sale.customerId
+      ? await tx.select({
+          paymentId: payments.id,
+          partyType: payments.partyType,
+          partyId: payments.partyId,
+          direction: payments.direction,
+          amount: payments.amount,
+          method: payments.method,
+          allocationAmount: paymentAllocations.amount,
+        })
+          .from(paymentAllocations)
+          .innerJoin(payments, eq(payments.id, paymentAllocations.paymentId))
+          .where(and(
+            eq(paymentAllocations.tenantId, ctx.tenantId),
+            eq(paymentAllocations.allocatedToType, "SALE"),
+            eq(paymentAllocations.allocatedToId, sale.id),
+            eq(payments.tenantId, ctx.tenantId),
+            eq(payments.direction, "IN"),
+          ))
+          .orderBy(asc(payments.createdAt), asc(payments.id), asc(paymentAllocations.id))
+      : [];
+
+    let refundRows = allocationRows;
+    if (sale.customerId && initialPaidUnits > 0n) {
+      const initialPayment = allocationRows[0];
+      if (
+        !initialPayment
+        || initialPayment.partyType !== "CUSTOMER"
+        || initialPayment.partyId !== sale.customerId
+        || decimalToUnits(initialPayment.amount) !== initialPaidUnits
+        || decimalToUnits(initialPayment.allocationAmount) !== initialPaidUnits
+      ) {
+        throw new AppError("INTERNAL_ERROR", "Initial sale payment allocation does not match its accounting journal");
+      }
+      refundRows = allocationRows.slice(1);
+    }
+
+    const refundsByPayment = new Map<string, {
+      partyId: string;
+      method: (typeof payments.$inferSelect)["method"];
+      amount: bigint;
+    }>();
+    for (const row of refundRows) {
+      if (row.partyType !== "CUSTOMER" || row.partyId !== sale.customerId) {
+        throw new AppError("INTERNAL_ERROR", "Sale payment allocation belongs to a different customer");
+      }
+      const current = refundsByPayment.get(row.paymentId);
+      refundsByPayment.set(row.paymentId, {
+        partyId: row.partyId,
+        method: row.method,
+        amount: (current?.amount ?? 0n) + decimalToUnits(row.allocationAmount),
+      });
+    }
+    const totalRefundUnits = [...refundsByPayment.values()].reduce((sum, refund) => sum + refund.amount, 0n);
+    if (sale.customerId && totalRefundUnits !== decimalToUnits(sale.paidTotal) - initialPaidUnits) {
+      throw new AppError("INTERNAL_ERROR", "Allocated sale payments do not match the recorded paid total");
+    }
+
+    const receivable = await tx.query.receivables.findFirst({
+      where: and(eq(receivables.tenantId, ctx.tenantId), eq(receivables.saleId, sale.id)),
+    });
+    if (receivable) {
+      if (
+        decimalToUnits(receivable.balance) !== decimalToUnits(sale.dueTotal)
+        || decimalToUnits(receivable.paidAmount) !== decimalToUnits(sale.paidTotal)
+      ) {
+        throw new AppError("INTERNAL_ERROR", "Sale receivable does not match the recorded sale balance");
+      }
+      await tx.update(receivables)
+        .set({ balance: "0", status: "CANCELLED", updatedAt: new Date() })
+        .where(and(eq(receivables.id, receivable.id), eq(receivables.tenantId, ctx.tenantId)));
+    } else if (decimalToUnits(sale.dueTotal) > 0n) {
+      throw new AppError("INTERNAL_ERROR", "Sale has an outstanding balance but no receivable");
+    }
+
+    const reversalJournals = [];
+    for (const journal of [...revenueJournals, ...cogsJournals]) {
+      const reversal = await postReversalJournal(tx, ctx, {
+        originalJournalId: journal.id,
+        operationId: deterministicSubOperationId(operationId, `journal:${journal.id}`),
+        reason: input.reason,
+      });
+      reversalJournals.push(reversal.id);
+    }
+
+    const refundPaymentIds: string[] = [];
+    if (sale.customerId) {
+      for (const [index, refund] of initialRefundMethods.entries()) {
+        const [refundPayment] = await tx.insert(payments).values({
+          tenantId: ctx.tenantId,
+          partyType: "CUSTOMER",
+          partyId: sale.customerId,
+          direction: "OUT",
+          amount: unitsToDecimal(refund.amount),
+          method: refund.method,
+          operationId: deterministicSubOperationId(operationId, `refund:initial:${index}`),
+          createdBy: ctx.userId,
+        }).returning();
+        if (!refundPayment) throw new AppError("INTERNAL_ERROR", "Unable to record initial sale refund");
+        await tx.insert(paymentAllocations).values({
+          tenantId: ctx.tenantId,
+          paymentId: refundPayment.id,
+          allocatedToType: "SALE",
+          allocatedToId: sale.id,
+          amount: unitsToDecimal(refund.amount),
+        });
+        refundPaymentIds.push(refundPayment.id);
+      }
+    }
+    for (const [paymentId, refund] of refundsByPayment) {
+      const refundAmount = unitsToDecimal(refund.amount);
+      const refundOperationId = deterministicSubOperationId(operationId, `refund:${paymentId}`);
+      const [refundPayment] = await tx.insert(payments).values({
+        tenantId: ctx.tenantId,
+        partyType: "CUSTOMER",
+        partyId: refund.partyId,
+        direction: "OUT",
+        amount: refundAmount,
+        method: refund.method,
+        operationId: refundOperationId,
+        createdBy: ctx.userId,
+      }).returning();
+      if (!refundPayment) throw new AppError("INTERNAL_ERROR", "Unable to record sale refund");
+      await tx.insert(paymentAllocations).values({
+        tenantId: ctx.tenantId,
+        paymentId: refundPayment.id,
+        allocatedToType: "SALE",
+        allocatedToId: sale.id,
+        amount: refundAmount,
+      });
+      await postCustomerSaleRefundJournal(tx, ctx, {
+        paymentId: refundPayment.id,
+        operationId: deterministicSubOperationId(operationId, `refund-journal:${paymentId}`),
+        amount: refundAmount,
+        method: refund.method,
+      });
+      refundPaymentIds.push(refundPayment.id);
+    }
+
+    const [cancelledSale] = await tx.update(sales)
+      .set({
+        status: "CANCELLED",
+        cancelledAt: new Date(),
+        cancelledReason: input.reason,
+        cancelOperationId: operationId,
+        updatedAt: new Date(),
+        updatedBy: ctx.userId,
+      })
+      .where(and(eq(sales.id, sale.id), eq(sales.tenantId, ctx.tenantId)))
+      .returning();
+    if (!cancelledSale) throw new AppError("INTERNAL_ERROR", "Unable to cancel sale");
+
+    await recordAudit(tx, ctx, {
+      action: "sale.cancel",
+      entityType: "SALE",
+      entityId: sale.id,
+      before: { status: sale.status, paidTotal: sale.paidTotal, dueTotal: sale.dueTotal },
+      after: {
+        status: cancelledSale.status,
+        refundTotal: unitsToDecimal(totalRefundUnits + initialPaidUnits),
+        refundPaymentIds,
+        reversalJournalIds: reversalJournals,
+      },
+      reason: input.reason,
+    });
+
+    return cancelledSale;
   });
 }
 

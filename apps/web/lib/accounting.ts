@@ -98,6 +98,7 @@ const SYSTEM_ACCOUNTS: Record<string, { name: string; type: "ASSET" | "LIABILITY
   "1200": { name: "Inventory", type: "ASSET" },
   "1300": { name: "Prepaid Expenses", type: "ASSET" }, // 08 §3.1 -- used here for supplier-payment unallocated advance
   "2000": { name: "Accounts Payable", type: "LIABILITY" },
+  "2100": { name: "Tax Payable", type: "LIABILITY" },
   "2300": { name: "Customer Advances", type: "LIABILITY" }, // 08 §3.2 / §5.3
   "3000": { name: "Owner Equity", type: "EQUITY" },
   "4000": { name: "Sales Revenue", type: "INCOME" },
@@ -294,11 +295,7 @@ export async function postSaleJournal(
   if (toUnits(params.dueTotal) > 0n) revenueLines.push({ code: "1100", debit: params.dueTotal });
   if (toUnits(params.discountTotal) > 0n) revenueLines.push({ code: "5100", debit: params.discountTotal });
   revenueLines.push({ code: "4000", credit: params.subtotal });
-  // Tax Payable (2100) intentionally omitted: taxTotal is currently
-  // always "0" everywhere in this codebase (no tax module active per
-  // 08 §8 MVP scope) -- adding a zero-amount line would itself violate
-  // "exactly one non-zero side" and serves no purpose until a caller
-  // actually computes a non-zero tax.
+  if (toUnits(params.taxTotal) > 0n) revenueLines.push({ code: "2100", credit: params.taxTotal });
 
   const revenueJournal = await postJournal(tx, ctx, {
     referenceType: "SALE",
@@ -363,6 +360,25 @@ export async function postCustomerPaymentJournal(
   });
 }
 
+/** Refund an allocated customer payment as part of sale cancellation. */
+export async function postCustomerSaleRefundJournal(
+  tx: Database,
+  ctx: TenantContext,
+  params: { paymentId: string; operationId: string; amount: string; method: string },
+) {
+  const cashOrBank = params.method === "CASH" ? "1000" : "1010";
+  return postJournal(tx, ctx, {
+    referenceType: "PAYMENT",
+    referenceId: params.paymentId,
+    operationId: params.operationId,
+    description: "Customer sale cancellation refund",
+    lines: [
+      { code: "1100", debit: params.amount },
+      { code: cashOrBank, credit: params.amount },
+    ],
+  });
+}
+
 /** Supplier Payment Made -- 08 §5.4. */
 export async function postSupplierPaymentJournal(
   tx: Database,
@@ -392,9 +408,8 @@ export async function postSupplierPaymentJournal(
  * originating sale's paid/due ratio" note -- this codebase's return
  * use case currently reduces the receivable when one exists and does
  * the cash case only when none does (an all-or-nothing simplification
- * of the proportional split 08 §5.5 describes; flagged as a known
- * gap, not silently "fixed" here since that is a returns.ts business-
- * logic change, not an accounting-posting one).
+ * of the proportional split 08 §5.5 describes; retained as a known
+ * settlement-policy gap).
  */
 export async function postCustomerReturnJournal(
   tx: Database,
@@ -403,6 +418,8 @@ export async function postCustomerReturnJournal(
     returnId: string;
     operationId: string;
     returnedSubtotal: string;
+    returnedTax: string;
+    returnedGrandTotal: string;
     returnedCostTotal: string;
     refundedInCash: boolean;
     /**
@@ -427,7 +444,8 @@ export async function postCustomerReturnJournal(
     description: "Customer return -- revenue reversal",
     lines: [
       { code: "4000", debit: params.returnedSubtotal },
-      { code: settlementCode, credit: params.returnedSubtotal },
+      ...(toUnits(params.returnedTax) > 0n ? [{ code: "2100", debit: params.returnedTax }] : []),
+      { code: settlementCode, credit: params.returnedGrandTotal },
     ],
   });
 

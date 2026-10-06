@@ -9,10 +9,10 @@
  * revision once these are migrated and verified.
  *
  * IMPORTANT: every table below is tenant-scoped (tenant_id mandatory,
- * per 05 §21). Row Level Security policies for these NEW tables are
- * applied via migrations-manual/0004_rls_policies_phase2.sql — RLS is
- * NOT expressed through Drizzle's schema builder, consistent with the
- * existing business_profiles precedent (05 §24-26).
+ * per 05 §21). Row Level Security policies are applied through the
+ * corresponding migrations-manual SQL files — RLS is NOT expressed
+ * through Drizzle's schema builder, consistent with the existing
+ * business_profiles precedent (05 §24-26).
  *
  * Partial UNIQUE constraints (e.g. phone/sku uniqueness only when the
  * value is non-null) are NOT expressed via Drizzle's `uniqueIndex()`
@@ -58,6 +58,20 @@ export const businessProfiles = core.table("business_profiles", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const taxProfiles = core.table(
+  "tax_profiles",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    rate: numeric("rate", { precision: 9, scale: 4 }).notNull(),
+    isInclusive: boolean("is_inclusive").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+);
 
 /* -------------------------------------------------------------- */
 /* Catalog primitives — per 06 v2.0 §5.7                            */
@@ -220,11 +234,8 @@ export const suppliers = core.table(
  * IS NOT NULL, per spec) — applied as a raw partial-unique-index
  * migration, NOT expressed here (see file docblock).
  *
- * `tax_profile_id` is a bare nullable uuid (no FK yet) — the Tax
- * domain (per 08 §8's TaxProfile entity) has no table of its own in
- * this schema revision; deferred until the Accounting phase actually
- * needs it, per the same "don't build ahead of the owning phase"
- * discipline already applied to business_profiles' settings_json.
+ * Tax assignment is tenant-validated by the catalog use case and
+ * backed by the tax_profiles FK (08 §8).
  */
 export const items = core.table(
   "items",
@@ -245,7 +256,7 @@ export const items = core.table(
       .references(() => units.id),
     purchasePrice: numeric("purchase_price", { precision: 18, scale: 4 }).notNull().default("0"),
     sellingPrice: numeric("selling_price", { precision: 18, scale: 4 }).notNull().default("0"),
-    taxProfileId: uuid("tax_profile_id"),
+    taxProfileId: uuid("tax_profile_id").references(() => taxProfiles.id, { onDelete: "set null" }),
     stockTracked: boolean("stock_tracked").notNull().default(true),
     batchTracked: boolean("batch_tracked").notNull().default(false),
     expiryTracked: boolean("expiry_tracked").notNull().default(false),
