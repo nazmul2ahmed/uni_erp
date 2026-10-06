@@ -37,3 +37,4 @@ Thumbs.db
 
 # Drizzle migration SQL files (source-controlled)
 !packages/db/migrations/*.sql
+!packages/db/migrations-manual/*.sql
