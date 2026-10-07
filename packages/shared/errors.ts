@@ -50,6 +50,7 @@ export const ERROR_STATUS = {
   // practice (08 §11 INV-ACC-001) — it exists as defense-in-depth, not
   // an expected business-rule rejection a client should ever render.
   UNBALANCED_JOURNAL: 500,
+  PERIOD_LOCKED: 409,
   RATE_LIMITED: 429,
   INTERNAL_ERROR: 500,
 } as const;

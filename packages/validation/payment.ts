@@ -47,21 +47,24 @@ import { idSchema, optionalShortTextSchema, positiveMoneyStringSchema } from "./
 export const paymentMethodSchema = z.enum(["CASH", "BANK", "MFS", "CARD", "CHEQUE", "ONLINE", "OTHER"]);
 
 /**
- * Explicit allocation against a specific open Sale. Per 07 §10.3:
- * "Allocate to specified Sale(s) / oldest-due-first if unspecified"
+ * Explicit allocation against a specific open Sale or opening receivable.
+ * Per 07 §10.3: "Allocate to specified document(s) / oldest-due-first
+ * if unspecified".
  * — `allocations` is therefore OPTIONAL on the parent schema; when
  * omitted, RecordCustomerPaymentUseCase auto-allocates oldest-due-first.
  */
 export const customerPaymentAllocationSchema = z.object({
-  saleId: idSchema,
+  saleId: idSchema.optional(),
+  openingBalanceId: idSchema.optional(),
   amount: positiveMoneyStringSchema,
-});
+}).refine((allocation) => Boolean(allocation.saleId) !== Boolean(allocation.openingBalanceId), "Provide exactly one allocation target");
 export type CustomerPaymentAllocationInput = z.infer<typeof customerPaymentAllocationSchema>;
 
 export const supplierPaymentAllocationSchema = z.object({
-  purchaseId: idSchema,
+  purchaseId: idSchema.optional(),
+  openingBalanceId: idSchema.optional(),
   amount: positiveMoneyStringSchema,
-});
+}).refine((allocation) => Boolean(allocation.purchaseId) !== Boolean(allocation.openingBalanceId), "Provide exactly one allocation target");
 export type SupplierPaymentAllocationInput = z.infer<typeof supplierPaymentAllocationSchema>;
 
 function sumAllocations(allocations: { amount: string }[] | undefined): number {

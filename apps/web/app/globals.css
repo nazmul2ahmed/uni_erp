@@ -117,12 +117,14 @@
 .report-filter-bar { align-items: end; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; display: flex; gap: 12px; margin-bottom: 22px; padding: 14px; }
 .report-filter-bar label { color: var(--ink); display: grid; font-size: 11px; font-weight: 700; gap: 6px; }
 .report-filter-bar input { background: var(--surface); border: 1px solid var(--line); border-radius: 4px; color: var(--ink); min-height: 38px; padding: 7px 8px; }
+.report-date-range { display: flex; gap: 12px; }
 .report-table-alternative { margin-top: 12px; overflow-x: auto; }
 .report-table-alternative table { min-width: 440px; }
 .report-generated { color: var(--muted); font-size: 11px; margin: 16px 0 0; }
 @media (max-width: 980px) { .finance-metrics { grid-template-columns: repeat(2, 1fr); } .finance-columns { grid-template-columns: 1fr; } .finance-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .finance-form-action { grid-column: 1 / -1; } }
 @media (max-width: 640px) { .finance-header { align-items: start; flex-direction: column; gap: 15px; } .finance-header .button { width: 100%; } .finance-metrics { grid-template-columns: 1fr; } .account-list { grid-template-columns: 1fr; } .finance-form-grid { grid-template-columns: 1fr; } .finance-form-action { grid-column: auto; } }
 @media (max-width: 640px) { .report-filter-bar { align-items: stretch; flex-direction: column; } .report-filter-bar label, .report-filter-bar input, .report-filter-bar .button { width: 100%; } }
+@media (max-width: 640px) { .report-date-range { flex-direction: column; } }
 
 /* Inline checkbox + label inside .finance-form-grid (Expenses reversal panel). */
 .checkbox-row{display:flex;align-items:center;gap:8px;flex-direction:row}

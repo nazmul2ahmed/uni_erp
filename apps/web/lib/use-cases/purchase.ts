@@ -202,6 +202,7 @@ export async function receivePurchase(ctx: TenantContext, input: CreatePurchaseI
       costTotal: purchase.grandTotal,
       paidTotal: purchase.paidTotal,
       dueTotal: purchase.dueTotal,
+      postedAt: purchase.purchaseDate,
     });
 
     await recordAudit(tx, ctx, {

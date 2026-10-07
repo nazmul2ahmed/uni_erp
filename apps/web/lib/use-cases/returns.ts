@@ -273,6 +273,7 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
       cashRefundAmount: decimal(cashRefund),
       receivableReductionAmount: decimal(receivableReduction),
       unsellableCostTotal: decimal(unsellableCostUnits), // Decision VAN-003
+      postedAt: record.returnDate,
     });
 
     await recordAudit(tx, ctx, {
@@ -407,6 +408,7 @@ export async function completeSupplierReturn(ctx: TenantContext, input: Supplier
       returnedCostTotal: decimal(total),
       supplierRefundAmount: decimal(supplierRefund),
       payableReductionAmount: decimal(payableReduction),
+      postedAt: record.returnDate,
     });
 
     await recordAudit(tx, ctx, {

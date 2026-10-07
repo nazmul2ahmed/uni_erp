@@ -20,7 +20,7 @@
  *
  * All arithmetic is exact (SQL numeric -> bigint 1e-4 units); no floats.
  */
-import { and, eq, gte, lte, sql } from "drizzle-orm";
+import { and, eq, gte, lte, ne, sql } from "drizzle-orm";
 import { accounts, journalEntries, journals, withTenantTransaction } from "@erp/db";
 import type { TenantContext } from "../guard";
 
@@ -76,6 +76,7 @@ export async function getProfitAndLoss(ctx: TenantContext, filter: ProfitLossFil
           eq(journals.tenantId, ctx.tenantId),
           eq(accounts.tenantId, ctx.tenantId),
           sql`${accounts.type} in ('INCOME', 'EXPENSE')`,
+          ne(journals.referenceType, "ACCOUNTING_PERIOD_CLOSE"),
           filter.dateFrom ? gte(journals.postedAt, new Date(filter.dateFrom)) : undefined,
           filter.dateTo ? lte(journals.postedAt, new Date(`${filter.dateTo}T23:59:59.999Z`)) : undefined,
         ),

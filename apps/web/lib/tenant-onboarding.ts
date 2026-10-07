@@ -90,6 +90,7 @@ export async function registerOwnerAndTenant(input: RegisterInput) {
       { tenantId: tenant!.id, code: "2000", name: "Accounts Payable", type: "LIABILITY", isSystemAccount: true },
       { tenantId: tenant!.id, code: "2100", name: "Tax Payable", type: "LIABILITY", isSystemAccount: true },
       { tenantId: tenant!.id, code: "3000", name: "Owner Equity", type: "EQUITY", isSystemAccount: true },
+      { tenantId: tenant!.id, code: "3100", name: "Retained Earnings", type: "EQUITY", isSystemAccount: true },
       { tenantId: tenant!.id, code: "4000", name: "Sales Revenue", type: "INCOME", isSystemAccount: true },
       { tenantId: tenant!.id, code: "5000", name: "Cost of Goods Sold", type: "EXPENSE", isSystemAccount: true },
     ]);

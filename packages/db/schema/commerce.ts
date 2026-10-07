@@ -706,7 +706,7 @@ export const paymentAllocations = core.table(
     paymentId: uuid("payment_id")
       .notNull()
       .references(() => payments.id, { onDelete: "cascade" }),
-    allocatedToType: text("allocated_to_type", { enum: ["SALE", "PURCHASE", "EXPENSE", "ADVANCE"] }).notNull(),
+    allocatedToType: text("allocated_to_type", { enum: ["SALE", "PURCHASE", "EXPENSE", "ADVANCE", "OPENING_BALANCE"] }).notNull(),
     allocatedToId: uuid("allocated_to_id"), // polymorphic, nullable for ADVANCE (unallocated remainder)
     amount: numeric("amount", { precision: 18, scale: 4 }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -794,6 +794,73 @@ export const journalEntries = core.table(
   (t) => ({
     tenantJournalIdx: index("journal_entries_tenant_journal_idx").on(t.tenantId, t.journalId),
     tenantAccountIdx: index("journal_entries_tenant_account_idx").on(t.tenantId, t.accountId),
+  }),
+);
+
+export const openingBalances = core.table(
+  "opening_balances",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    entryType: text("entry_type", {
+      enum: ["CASH", "BANK", "STOCK", "CUSTOMER_RECEIVABLE", "SUPPLIER_PAYABLE", "CAPITAL"],
+    }).notNull(),
+    referenceId: uuid("reference_id").notNull(),
+    customerId: uuid("customer_id").references(() => customers.id),
+    supplierId: uuid("supplier_id").references(() => suppliers.id),
+    accountCode: text("account_code"),
+    amount: numeric("amount", { precision: 18, scale: 4 }).notNull(),
+    paidAmount: numeric("paid_amount", { precision: 18, scale: 4 }).notNull().default("0"),
+    balance: numeric("balance", { precision: 18, scale: 4 }).notNull(),
+    status: text("status", { enum: ["OPEN", "PARTIAL", "SETTLED"] }).notNull().default("OPEN"),
+    dueDate: date("due_date"),
+    journalId: uuid("journal_id").notNull().references(() => journals.id),
+    operationId: uuid("operation_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id),
+  },
+  (t) => ({
+    tenantReferenceUnique: uniqueIndex("opening_balances_tenant_type_reference_unique").on(t.tenantId, t.entryType, t.referenceId),
+    tenantOperationUnique: uniqueIndex("opening_balances_tenant_operation_unique").on(t.tenantId, t.operationId),
+    tenantCustomerIdx: index("opening_balances_tenant_customer_idx").on(t.tenantId, t.customerId),
+    tenantSupplierIdx: index("opening_balances_tenant_supplier_idx").on(t.tenantId, t.supplierId),
+  }),
+);
+
+export const accountingPeriods = core.table(
+  "accounting_periods",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    periodStart: date("period_start", { mode: "string" }).notNull(),
+    periodEnd: date("period_end", { mode: "string" }).notNull(),
+    status: text("status", { enum: ["OPEN", "CLOSED"] }).notNull().default("CLOSED"),
+    closingJournalId: uuid("closing_journal_id").references(() => journals.id),
+    closedAt: timestamp("closed_at", { withTimezone: true }),
+    closedBy: uuid("closed_by").references(() => users.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    tenantRangeUnique: uniqueIndex("accounting_periods_tenant_range_unique").on(t.tenantId, t.periodStart, t.periodEnd),
+    tenantEndIdx: index("accounting_periods_tenant_end_idx").on(t.tenantId, t.periodEnd),
+  }),
+);
+
+export const accountingPeriodEvents = core.table(
+  "accounting_period_events",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    tenantId: uuid("tenant_id").notNull().references(() => tenants.id, { onDelete: "cascade" }),
+    periodId: uuid("period_id").notNull().references(() => accountingPeriods.id, { onDelete: "cascade" }),
+    action: text("action", { enum: ["CLOSE", "REOPEN"] }).notNull(),
+    operationId: uuid("operation_id").notNull(),
+    journalId: uuid("journal_id").references(() => journals.id),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    createdBy: uuid("created_by").references(() => users.id),
+  },
+  (t) => ({
+    tenantOperationUnique: uniqueIndex("accounting_period_events_tenant_operation_unique").on(t.tenantId, t.operationId),
+    tenantPeriodIdx: index("accounting_period_events_tenant_period_idx").on(t.tenantId, t.periodId),
   }),
 );
 

@@ -14,4 +14,5 @@ export * from "./warehouse";
 export * from "./tenant-features";
 export * from "./rep-stock";
 export * from "./expense";
+export * from "./accounting";
 export * from "./tax-profile";

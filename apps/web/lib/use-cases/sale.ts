@@ -452,6 +452,7 @@ export async function completeSale(ctx: TenantContext, input: CreateSaleInput, o
       dueTotal: sale.dueTotal,
       costOfLinesAtCost: unitsToDecimal(costOfLinesUnits),
       inventoryAccountCode: fieldSale ? "1250" : "1200",
+      postedAt: sale.saleDate,
     });
 
     await recordAudit(tx, ctx, {

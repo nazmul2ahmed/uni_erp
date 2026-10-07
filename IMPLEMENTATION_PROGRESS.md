@@ -81,7 +81,10 @@ still a separate release gate.
 
 ### Immediate next work, in roadmap order
 
-1. Continue with Phase 3 — Accounting Depth under `Plan/28` §4.
+1. Continue Phase 3 — Accounting Depth under `Plan/28` §4. Trial Balance is
+   now available as a verified first report slice; opening entries, the
+   remaining financial reports, aging, manual adjustments, and period close
+   remain unimplemented and must not be treated as complete.
 2. Keep isolated staging (`Plan/25` §§2–3) deferred as non-code deployment
    work. Do not describe Phase 1 as formally exited until staging and all
    other required criteria are verified.
@@ -89,7 +92,33 @@ still a separate release gate.
    health-check, and migration evidence here; then re-evaluate release
    readiness.
 
+### Phase 3 — Accounting Depth (in progress)
+
+- Implemented Trial Balance per `Plan/08` §6.1 and `Plan/11` §14 as a
+  tenant-scoped query and `GET /api/accounting/trial-balance`, plus a date-
+  filterable Finance workspace view. The report uses exact four-decimal
+  arithmetic, verifies total debits equal total credits, and logs/surfaces an
+  integrity error if the ledger is out of balance.
+- Real-PostgreSQL coverage verifies account totals, inclusive date boundaries,
+  tenant isolation, empty-ledger behavior, and the imbalance alert/error path:
+  `pnpm --filter web exec vitest run test/trial-balance.integration.test.ts`
+  passed (3 tests). `pnpm --filter web typecheck` and targeted ESLint passed.
+- `pnpm build` passed on 2026-10-07; Next.js emitted dynamic-route notices for
+  authenticated API routes, then completed the production build successfully.
+- Branch filtering is intentionally not exposed: `core.journals` has no
+  `branch_id` yet, and `Plan/08` §6.2 identifies that as requiring a schema
+  decision. Other Phase 3 targets remain open.
+
 ## Work log
+
+### 2026-10-07 — Phase 3 Trial Balance
+
+- Added exact, tenant-scoped Trial Balance aggregation, the accounting.view-
+  guarded report endpoint, and a date-filtered view in Finance.
+- Verified inclusive date filtering, per-account totals, tenant isolation,
+  empty-ledger output, and observable imbalance detection with real PostgreSQL.
+- Validation: focused integration suite (3 tests), web typecheck, and targeted
+  ESLint passed. Phase 3 remains in progress.
 
 ### 2026-10-07 — Phase 2 Core Commerce exit
 

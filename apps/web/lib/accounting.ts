@@ -21,9 +21,9 @@
  * ledger-posting chokepoint, applied here to the ledger's financial
  * counterpart.
  */
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { createHash } from "node:crypto";
-import { accounts, journals, journalEntries } from "@erp/db";
+import { accounts, accountingPeriods, journals, journalEntries } from "@erp/db";
 import { AppError } from "@erp/shared";
 import type { Database } from "@erp/db";
 import type { TenantContext } from "./guard";
@@ -101,6 +101,7 @@ const SYSTEM_ACCOUNTS: Record<string, { name: string; type: "ASSET" | "LIABILITY
   "2100": { name: "Tax Payable", type: "LIABILITY" },
   "2300": { name: "Customer Advances", type: "LIABILITY" }, // 08 §3.2 / §5.3
   "3000": { name: "Owner Equity", type: "EQUITY" },
+  "3100": { name: "Retained Earnings", type: "EQUITY" },
   "4000": { name: "Sales Revenue", type: "INCOME" },
   "4900": { name: "Other Income", type: "INCOME" }, // seeded for forward-compat, unused today
   "5000": { name: "Cost of Goods Sold", type: "EXPENSE" },
@@ -169,6 +170,40 @@ async function resolveAccountId(tx: Database, tenantId: string, code: string): P
   return resolved.id;
 }
 
+export async function getClosedAccountingPeriod(tx: Database, tenantId: string, postedAt: Date) {
+  const day = postedAt.toISOString().slice(0, 10);
+  return tx.query.accountingPeriods.findFirst({
+    where: and(
+      eq(accountingPeriods.tenantId, tenantId),
+      eq(accountingPeriods.status, "CLOSED"),
+      sql`${accountingPeriods.periodStart} <= ${day}::date`,
+      sql`${accountingPeriods.periodEnd} >= ${day}::date`,
+    ),
+  });
+}
+
+export async function assertAccountingPeriodOpen(tx: Database, tenantId: string, postedAt: Date): Promise<void> {
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${tenantId}, 0))`);
+  const period = await getClosedAccountingPeriod(tx, tenantId, postedAt);
+  if (period) {
+    throw new AppError("PERIOD_LOCKED", "The accounting date falls in a closed period", {
+      periodId: period.id,
+      periodStart: period.periodStart,
+      periodEnd: period.periodEnd,
+    });
+  }
+}
+
+export async function firstOpenAccountingDate(tx: Database, tenantId: string, requestedDate: Date): Promise<Date> {
+  let candidate = new Date(requestedDate);
+  while (true) {
+    const period = await getClosedAccountingPeriod(tx, tenantId, candidate);
+    if (!period) return candidate;
+    candidate = new Date(`${period.periodEnd}T00:00:00.000Z`);
+    candidate.setUTCDate(candidate.getUTCDate() + 1);
+  }
+}
+
 export interface JournalLine {
   /** Chart-of-accounts code, e.g. "1000" (Cash). */
   code: string;
@@ -197,6 +232,10 @@ export async function postJournal(tx: Database, ctx: TenantContext, input: PostJ
     where: and(eq(journals.tenantId, ctx.tenantId), eq(journals.operationId, input.operationId)),
   });
   if (existing) return existing;
+  const postedAt = input.postedAt ?? new Date();
+  if (input.referenceType !== "ACCOUNTING_PERIOD_CLOSE") {
+    await assertAccountingPeriodOpen(tx, ctx.tenantId, postedAt);
+  }
 
   if (input.lines.length < 2) {
     throw new AppError("INTERNAL_ERROR", "A journal requires at least two entries (08 §11 INV-ACC-002)");
@@ -234,7 +273,7 @@ export async function postJournal(tx: Database, ctx: TenantContext, input: PostJ
       description: input.description,
       operationId: input.operationId,
       createdBy: ctx.userId,
-      ...(input.postedAt ? { postedAt: input.postedAt } : {}),
+      postedAt,
     })
     .returning();
   if (!journal) throw new AppError("INTERNAL_ERROR", "Unable to post journal");
@@ -281,6 +320,7 @@ export async function postSaleJournal(
     dueTotal: string;
     /** Sum of (quantity * unit cost) across stock-tracked lines only -- 09 §6.3. "0" for an all-service sale (no COGS journal posted in that case). */
     costOfLinesAtCost: string;
+    postedAt?: Date;
     /**
      * Asset account relieved by COGS. Default "1200" (Inventory). A Van
      * Sales field sale passes "1250" (Stock With Sales Reps): the goods
@@ -302,6 +342,7 @@ export async function postSaleJournal(
     referenceId: params.saleId,
     operationId: deterministicSubOperationId(params.operationId, "revenue"),
     description: "Sale revenue recognition",
+    postedAt: params.postedAt,
     lines: revenueLines,
   });
 
@@ -311,6 +352,7 @@ export async function postSaleJournal(
       referenceId: params.saleId,
       operationId: deterministicSubOperationId(params.operationId, "cogs"),
       description: "Sale cost of goods sold",
+      postedAt: params.postedAt,
       lines: [
         { code: "5000", debit: params.costOfLinesAtCost },
         { code: params.inventoryAccountCode ?? "1200", credit: params.costOfLinesAtCost },
@@ -325,7 +367,7 @@ export async function postSaleJournal(
 export async function postPurchaseJournal(
   tx: Database,
   ctx: TenantContext,
-  params: { purchaseId: string; operationId: string; costTotal: string; paidTotal: string; dueTotal: string },
+  params: { purchaseId: string; operationId: string; costTotal: string; paidTotal: string; dueTotal: string; postedAt?: Date },
 ) {
   const lines: JournalLine[] = [{ code: "1200", debit: params.costTotal }];
   if (toUnits(params.paidTotal) > 0n) lines.push({ code: "1010", credit: params.paidTotal });
@@ -336,6 +378,7 @@ export async function postPurchaseJournal(
     referenceId: params.purchaseId,
     operationId: params.operationId,
     description: "Purchase received",
+    postedAt: params.postedAt,
     lines,
   });
 }
@@ -344,7 +387,7 @@ export async function postPurchaseJournal(
 export async function postCustomerPaymentJournal(
   tx: Database,
   ctx: TenantContext,
-  params: { paymentId: string; operationId: string; amount: string; allocatedToReceivables: string; unallocated: string; method: string },
+  params: { paymentId: string; operationId: string; amount: string; allocatedToReceivables: string; unallocated: string; method: string; postedAt?: Date },
 ) {
   const cashOrBank = params.method === "CASH" ? "1000" : "1010";
   const lines: JournalLine[] = [{ code: cashOrBank, debit: params.amount }];
@@ -356,6 +399,7 @@ export async function postCustomerPaymentJournal(
     referenceId: params.paymentId,
     operationId: params.operationId,
     description: "Customer payment received",
+    postedAt: params.postedAt,
     lines,
   });
 }
@@ -383,7 +427,7 @@ export async function postCustomerSaleRefundJournal(
 export async function postSupplierPaymentJournal(
   tx: Database,
   ctx: TenantContext,
-  params: { paymentId: string; operationId: string; amount: string; allocatedToPayables: string; unallocated: string; method: string },
+  params: { paymentId: string; operationId: string; amount: string; allocatedToPayables: string; unallocated: string; method: string; postedAt?: Date },
 ) {
   const cashOrBank = params.method === "CASH" ? "1000" : "1010";
   const lines: JournalLine[] = [];
@@ -396,6 +440,7 @@ export async function postSupplierPaymentJournal(
     referenceId: params.paymentId,
     operationId: params.operationId,
     description: "Supplier payment made",
+    postedAt: params.postedAt,
     lines,
   });
 }
@@ -413,6 +458,7 @@ export async function postCustomerReturnJournal(
     returnedCostTotal: string;
     cashRefundAmount: string;
     receivableReductionAmount: string;
+    postedAt?: Date;
     /**
      * Decision VAN-003 (30_MODULE_VAN_SALES.md §5.2) — the portion of
      * returnedCostTotal that is physically UNSELLABLE (damaged/expired
@@ -435,6 +481,7 @@ export async function postCustomerReturnJournal(
     referenceId: params.returnId,
     operationId: deterministicSubOperationId(params.operationId, "revenue"),
     description: "Customer return -- revenue reversal",
+    postedAt: params.postedAt,
     lines: [
       { code: "4000", debit: params.returnedSubtotal },
       ...(toUnits(params.returnedTax) > 0n ? [{ code: "2100", debit: params.returnedTax }] : []),
@@ -448,6 +495,7 @@ export async function postCustomerReturnJournal(
       referenceId: params.returnId,
       operationId: deterministicSubOperationId(params.operationId, "cogs"),
       description: "Customer return -- inventory reinstated",
+      postedAt: params.postedAt,
       lines: [
         { code: "1200", debit: params.returnedCostTotal },
         { code: "5000", credit: params.returnedCostTotal },
@@ -462,6 +510,7 @@ export async function postCustomerReturnJournal(
       referenceId: params.returnId,
       operationId: deterministicSubOperationId(params.operationId, "writeoff"),
       description: "Customer return -- unsellable write-off",
+      postedAt: params.postedAt,
       lines: [
         { code: "5500", debit: unsellableCostTotal },
         { code: "1200", credit: unsellableCostTotal },
@@ -491,7 +540,7 @@ export async function postCustomerReturnJournal(
 export async function postRepIssueJournal(
   tx: Database,
   ctx: TenantContext,
-  params: { assignmentId: string; operationId: string; costTotal: string },
+  params: { assignmentId: string; operationId: string; costTotal: string; postedAt?: Date },
 ) {
   // Guard mirrors postSaleJournal's COGS-block guard above: a
   // zero-cost issue (free-sample item, or an item whose cost basis is
@@ -506,6 +555,7 @@ export async function postRepIssueJournal(
     referenceId: params.assignmentId,
     operationId: params.operationId,
     description: "Field-rep stock issue -- custody transfer",
+    postedAt: params.postedAt,
     lines: [
       { code: "1250", debit: params.costTotal },
       { code: "1200", credit: params.costTotal },
@@ -526,7 +576,7 @@ export async function postRepIssueJournal(
 export async function postCustodyWriteOffJournal(
   tx: Database,
   ctx: TenantContext,
-  params: { assignmentId: string; operationId: string; costTotal: string },
+  params: { assignmentId: string; operationId: string; costTotal: string; postedAt?: Date },
 ) {
   if (toUnits(params.costTotal) <= 0n) return undefined; // zero-cost write-off: no ledger effect (INV-ACC-001)
   return postJournal(tx, ctx, {
@@ -534,6 +584,7 @@ export async function postCustodyWriteOffJournal(
     referenceId: params.assignmentId,
     operationId: params.operationId,
     description: "Field-rep custody write-off -- damaged/expired",
+    postedAt: params.postedAt,
     lines: [
       { code: "5500", debit: params.costTotal },
       { code: "1250", credit: params.costTotal },
@@ -551,6 +602,7 @@ export async function postSupplierReturnJournal(
     returnedCostTotal: string;
     supplierRefundAmount: string;
     payableReductionAmount: string;
+    postedAt?: Date;
   },
 ) {
   const settlementLines: JournalLine[] = [];
@@ -561,6 +613,7 @@ export async function postSupplierReturnJournal(
     referenceId: params.returnId,
     operationId: params.operationId,
     description: "Supplier return",
+    postedAt: params.postedAt,
     lines: [
       ...settlementLines,
       { code: "1200", credit: params.returnedCostTotal },
@@ -629,6 +682,8 @@ export async function postReversalJournal(
 
   const originalEntries = await tx.select().from(journalEntries).where(and(eq(journalEntries.tenantId, ctx.tenantId), eq(journalEntries.journalId, original.id)));
   if (originalEntries.length < 2) throw new AppError("INTERNAL_ERROR", "Original journal has fewer than two entries (INV-ACC-002)");
+  await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${ctx.tenantId}, 0))`);
+  const postedAt = await firstOpenAccountingDate(tx, ctx.tenantId, params.postedAt ?? original.postedAt);
 
   const [journal] = await tx
     .insert(journals)
@@ -637,7 +692,7 @@ export async function postReversalJournal(
       referenceType: "REVERSAL",
       referenceId: original.id,
       description: `Reversal: ${params.reason}`,
-      postedAt: params.postedAt ?? original.postedAt,
+      postedAt,
       operationId: params.operationId,
       createdBy: ctx.userId,
     })
