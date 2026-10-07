@@ -163,13 +163,13 @@ Phase 1 code from starting.
 **Phase 2 exit criteria:**
 
 ```text
-[ ] All Phase 2-owned rows in the Financial Testing Matrix (24 §3) pass
-[ ] Inventory Testing Matrix (24 §4) passes for FIFO (batch/serial/
+[x] All Phase 2-owned rows in the Financial Testing Matrix (24 §3) pass
+[x] Inventory Testing Matrix (24 §4) passes for FIFO (batch/serial/
     FEFO deferred to their owning phase, §5)
-[ ] A tenant can complete: Purchase -> Stock -> POS Sale -> Payment
+[x] A tenant can complete: Purchase -> Stock -> POS Sale -> Payment
     -> Customer Due -> Basic P&L, entirely through the UI (03 §84's
     MVP Definition, now testable end-to-end)
-[ ] Customer and supplier returns reverse historical discounts/tax and
+[x] Customer and supplier returns reverse historical discounts/tax and
     preserve partial-return rounding; sale cancellation behavior for
     already received/allocated payments is explicitly decided and tested
 ```
@@ -179,10 +179,15 @@ matrix, not a requirement to build Phase 3 accounting controls inside Phase 2.
 The Phase 2 gate covers the sale, purchase, payment, return, idempotency, and
 posting invariants for Phase 2 use cases. Opening entries, period close, and
 manual journal adjustments are Phase 3 gates, alongside the Phase 3 accounting
-depth scope below. Tax remains in the Phase 2 gate under `08` §8; its
-tax-exclusive profile/pricing behavior and return reversals are implemented
-locally. Sale cancellation/payment settlement policy remains a Phase 2 blocker
-until explicitly decided and tested.
+depth scope below. Tax remains in the Phase 2 gate under `08` §8. Phase 2
+inventory matrix evidence covers receipt/batch creation, FIFO allocation and
+batch costing, purchase weighted-average recalculation, concurrent last-unit
+protection, and atomic returns. FEFO, serial selection, reservations, transfer,
+offline-origin conflicts, stock-count workflow, and background reconciliation
+remain assigned to their owning roadmap phases; they are not Phase 2 exit
+criteria. Customer and supplier return settlement use the originating
+transaction's paid/due ratio with cumulative rounding; sale-cancellation
+settlement policy and behavior are decided and tested.
 
 ## Phase 3 — Accounting Depth
 

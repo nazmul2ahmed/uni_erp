@@ -1,0 +1,2 @@
+ALTER TABLE "core"."returns" ADD COLUMN "supplier_refund_amount" numeric(18, 4) DEFAULT '0' NOT NULL;--> statement-breakpoint
+ALTER TABLE "core"."returns" ADD COLUMN "payable_reduction_amount" numeric(18, 4) DEFAULT '0' NOT NULL;

@@ -1,6 +1,9 @@
 import { and, asc, eq, isNull } from "drizzle-orm";
 import {
+  accounts,
   items,
+  journalEntries,
+  journals,
   payables,
   purchases,
   purchaseItems,
@@ -23,6 +26,7 @@ import type { CustomerReturnInput, StockAdjustmentInput, SupplierReturnInput } f
 import type { TenantContext } from "../guard";
 import { postCustomerReturnJournal, postSupplierReturnJournal } from "../accounting";
 import { recordAudit } from "../audit";
+import { roundRatio } from "../money";
 
 const scale = 10000n;
 
@@ -167,7 +171,65 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
     const subtotal = selected.reduce((sum, line) => sum + line.subtotal, 0n);
     const tax = selected.reduce((sum, line) => sum + line.tax, 0n);
     const total = subtotal + tax;
-    const [record] = await tx.insert(returns).values({ tenantId: ctx.tenantId, type: "CUSTOMER_RETURN", saleId: sale.id, partyId: sale.customerId, warehouseId: input.warehouseId, subtotal: decimal(subtotal), taxTotal: decimal(tax), grandTotal: decimal(total), operationId, notes: input.notes, createdBy: ctx.userId }).returning();
+    const originalRevenue = await tx.query.journals.findFirst({
+      where: and(
+        eq(journals.tenantId, ctx.tenantId),
+        eq(journals.referenceType, "SALE"),
+        eq(journals.referenceId, sale.id),
+        eq(journals.description, "Sale revenue recognition"),
+      ),
+    });
+    if (!originalRevenue) throw new AppError("INTERNAL_ERROR", "Original sale revenue journal is missing");
+    const originalSettlement = await tx.select({ code: accounts.code, debit: journalEntries.debit })
+      .from(journalEntries)
+      .innerJoin(accounts, eq(accounts.id, journalEntries.accountId))
+      .where(and(eq(journalEntries.tenantId, ctx.tenantId), eq(journalEntries.journalId, originalRevenue.id)));
+    const originalPaid = originalSettlement
+      .filter((line) => line.code === "1000" || line.code === "1010")
+      .reduce((sum, line) => sum + units(line.debit), 0n);
+    const originalDue = originalSettlement
+      .filter((line) => line.code === "1100")
+      .reduce((sum, line) => sum + units(line.debit), 0n);
+    const originalTotal = originalPaid + originalDue;
+    const priorCustomerReturns = await tx.query.returns.findMany({
+      where: and(
+        eq(returns.tenantId, ctx.tenantId),
+        eq(returns.saleId, sale.id),
+        eq(returns.type, "CUSTOMER_RETURN"),
+        eq(returns.status, "COMPLETED"),
+      ),
+    });
+    const priorReturnedTotal = priorCustomerReturns.reduce((sum, row) => sum + units(row.grandTotal), 0n);
+    const priorCashRefunded = priorCustomerReturns.reduce((sum, row) => sum + units(row.cashRefundAmount), 0n);
+    const cumulativeCashTarget = originalTotal > 0n
+      ? roundRatio((priorReturnedTotal + total) * originalPaid, originalTotal)
+      : 0n;
+    const cashRatioShare = cumulativeCashTarget > priorCashRefunded
+      ? cumulativeCashTarget - priorCashRefunded
+      : 0n;
+    const receivableRows = await tx.select().from(receivables)
+      .where(and(eq(receivables.tenantId, ctx.tenantId), eq(receivables.saleId, sale.id)))
+      .for("update");
+    const receivable = receivableRows[0];
+    const dueRatioShare = total > cashRatioShare ? total - cashRatioShare : 0n;
+    const availableReceivable = receivable ? units(receivable.balance) : 0n;
+    const receivableReduction = dueRatioShare < availableReceivable ? dueRatioShare : availableReceivable;
+    const cashRefund = total - receivableReduction;
+    const [record] = await tx.insert(returns).values({
+      tenantId: ctx.tenantId,
+      type: "CUSTOMER_RETURN",
+      saleId: sale.id,
+      partyId: sale.customerId,
+      warehouseId: input.warehouseId,
+      subtotal: decimal(subtotal),
+      taxTotal: decimal(tax),
+      grandTotal: decimal(total),
+      cashRefundAmount: decimal(cashRefund),
+      receivableReductionAmount: decimal(receivableReduction),
+      operationId,
+      notes: input.notes,
+      createdBy: ctx.userId,
+    }).returning();
     if (!record) throw new AppError("INTERNAL_ERROR", "Unable to create customer return");
     let returnedCostUnits = 0n;
     let unsellableCostUnits = 0n; // Decision VAN-003
@@ -191,11 +253,14 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
         await tx.insert(stockMovements).values({ tenantId: ctx.tenantId, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, serialId: line.source.serialId, movementType: "LOSS", quantity: decimal(-line.quantity), referenceType: "RETURN", referenceId: record.id, operationId: crypto.randomUUID(), createdBy: ctx.userId });
       }
     }
-    const receivable = await tx.query.receivables.findFirst({ where: and(eq(receivables.tenantId, ctx.tenantId), eq(receivables.saleId, sale.id)) });
     if (receivable) {
-      const nextAmount = units(receivable.amount) - total;
-      const nextBalance = units(receivable.balance) - total;
-      await tx.update(receivables).set({ amount: decimal(nextAmount > 0n ? nextAmount : 0n), balance: decimal(nextBalance > 0n ? nextBalance : 0n), status: nextBalance <= 0n ? "SETTLED" : receivable.status, updatedAt: new Date() }).where(eq(receivables.id, receivable.id));
+      const nextBalance = availableReceivable - receivableReduction;
+      await tx.update(receivables).set({
+        amount: decimal(units(receivable.paidAmount) + nextBalance),
+        balance: decimal(nextBalance),
+        status: nextBalance === 0n ? "SETTLED" : "PARTIAL",
+        updatedAt: new Date(),
+      }).where(and(eq(receivables.id, receivable.id), eq(receivables.tenantId, ctx.tenantId)));
     }
 
     await postCustomerReturnJournal(tx, ctx, {
@@ -205,13 +270,8 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
       returnedTax: decimal(tax),
       returnedGrandTotal: decimal(total),
       returnedCostTotal: decimal(returnedCostUnits),
-      // No receivable found => the sale was already fully paid, so
-      // this return settles as a cash refund rather than a reduction
-      // of an outstanding balance (08 §5.5's paid/due-ratio note;
-      // see accounting.ts's postCustomerReturnJournal docblock for
-      // the known all-or-nothing simplification versus a proportional
-      // split).
-      refundedInCash: !receivable,
+      cashRefundAmount: decimal(cashRefund),
+      receivableReductionAmount: decimal(receivableReduction),
       unsellableCostTotal: decimal(unsellableCostUnits), // Decision VAN-003
     });
 
@@ -219,7 +279,14 @@ export async function completeCustomerReturn(ctx: TenantContext, input: Customer
       action: "return.customer.complete",
       entityType: "RETURN",
       entityId: record.id,
-      after: { saleId: sale.id, subtotal: decimal(subtotal), taxTotal: decimal(tax), grandTotal: decimal(total) },
+      after: {
+        saleId: sale.id,
+        subtotal: decimal(subtotal),
+        taxTotal: decimal(tax),
+        grandTotal: decimal(total),
+        cashRefundAmount: decimal(cashRefund),
+        receivableReductionAmount: decimal(receivableReduction),
+      },
     });
 
     return record;
@@ -231,7 +298,9 @@ export async function completeSupplierReturn(ctx: TenantContext, input: Supplier
     const replay = await tx.query.returns.findFirst({ where: and(eq(returns.tenantId, ctx.tenantId), eq(returns.operationId, operationId)) });
     if (replay) return replay;
     await assertWarehouse(tx, ctx, input.warehouseId);
-    const purchase = await tx.query.purchases.findFirst({ where: and(eq(purchases.id, input.purchaseId), eq(purchases.tenantId, ctx.tenantId)) });
+    const [purchase] = await tx.select().from(purchases)
+      .where(and(eq(purchases.id, input.purchaseId), eq(purchases.tenantId, ctx.tenantId)))
+      .for("update");
     if (!purchase) throw new AppError("RESOURCE_NOT_FOUND", "Purchase not found");
     requestedLineIds(input.lines);
     const sourceLines = await tx.select().from(purchaseItems).where(and(eq(purchaseItems.purchaseId, purchase.id), eq(purchaseItems.tenantId, ctx.tenantId))).orderBy(asc(purchaseItems.id)).for("update");
@@ -255,7 +324,65 @@ export async function completeSupplierReturn(ctx: TenantContext, input: Supplier
     const subtotal = selected.reduce((sum, line) => sum + line.subtotal, 0n);
     const tax = selected.reduce((sum, line) => sum + line.tax, 0n);
     const total = subtotal + tax;
-    const [record] = await tx.insert(returns).values({ tenantId: ctx.tenantId, type: "SUPPLIER_RETURN", purchaseId: purchase.id, partyId: purchase.supplierId, warehouseId: input.warehouseId, subtotal: decimal(subtotal), taxTotal: decimal(tax), grandTotal: decimal(total), operationId, notes: input.notes, createdBy: ctx.userId }).returning();
+    const originalPurchase = await tx.query.journals.findFirst({
+      where: and(
+        eq(journals.tenantId, ctx.tenantId),
+        eq(journals.referenceType, "PURCHASE"),
+        eq(journals.referenceId, purchase.id),
+        eq(journals.description, "Purchase received"),
+      ),
+    });
+    if (!originalPurchase) throw new AppError("INTERNAL_ERROR", "Original purchase journal is missing");
+    const originalSettlement = await tx.select({ code: accounts.code, credit: journalEntries.credit })
+      .from(journalEntries)
+      .innerJoin(accounts, eq(accounts.id, journalEntries.accountId))
+      .where(and(eq(journalEntries.tenantId, ctx.tenantId), eq(journalEntries.journalId, originalPurchase.id)));
+    const originalPaid = originalSettlement
+      .filter((line) => line.code === "1000" || line.code === "1010")
+      .reduce((sum, line) => sum + units(line.credit), 0n);
+    const originalDue = originalSettlement
+      .filter((line) => line.code === "2000")
+      .reduce((sum, line) => sum + units(line.credit), 0n);
+    const originalTotal = originalPaid + originalDue;
+    const priorSupplierReturns = await tx.query.returns.findMany({
+      where: and(
+        eq(returns.tenantId, ctx.tenantId),
+        eq(returns.purchaseId, purchase.id),
+        eq(returns.type, "SUPPLIER_RETURN"),
+        eq(returns.status, "COMPLETED"),
+      ),
+    });
+    const priorReturnedTotal = priorSupplierReturns.reduce((sum, row) => sum + units(row.grandTotal), 0n);
+    const priorSupplierRefunded = priorSupplierReturns.reduce((sum, row) => sum + units(row.supplierRefundAmount), 0n);
+    const cumulativeRefundTarget = originalTotal > 0n
+      ? roundRatio((priorReturnedTotal + total) * originalPaid, originalTotal)
+      : 0n;
+    const cashRatioShare = cumulativeRefundTarget > priorSupplierRefunded
+      ? cumulativeRefundTarget - priorSupplierRefunded
+      : 0n;
+    const payableRows = await tx.select().from(payables)
+      .where(and(eq(payables.tenantId, ctx.tenantId), eq(payables.purchaseId, purchase.id)))
+      .for("update");
+    const payable = payableRows[0];
+    const dueRatioShare = total > cashRatioShare ? total - cashRatioShare : 0n;
+    const availablePayable = payable ? units(payable.balance) : 0n;
+    const payableReduction = dueRatioShare < availablePayable ? dueRatioShare : availablePayable;
+    const supplierRefund = total - payableReduction;
+    const [record] = await tx.insert(returns).values({
+      tenantId: ctx.tenantId,
+      type: "SUPPLIER_RETURN",
+      purchaseId: purchase.id,
+      partyId: purchase.supplierId,
+      warehouseId: input.warehouseId,
+      subtotal: decimal(subtotal),
+      taxTotal: decimal(tax),
+      grandTotal: decimal(total),
+      supplierRefundAmount: decimal(supplierRefund),
+      payableReductionAmount: decimal(payableReduction),
+      operationId,
+      notes: input.notes,
+      createdBy: ctx.userId,
+    }).returning();
     if (!record) throw new AppError("INTERNAL_ERROR", "Unable to create supplier return");
     for (const line of selected) {
       await tx.insert(returnLines).values({ tenantId: ctx.tenantId, returnId: record.id, purchaseItemId: line.source.id, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, quantity: decimal(line.quantity), unitPrice: line.source.costPrice, lineTotal: decimal(line.total), taxAmount: decimal(line.tax) });
@@ -264,22 +391,22 @@ export async function completeSupplierReturn(ctx: TenantContext, input: Supplier
       await updateBalance(tx, ctx, line.source.itemId, line.source.warehouseId, line.source.batchId, -line.quantity, item.allowNegativeStock);
       await tx.insert(stockMovements).values({ tenantId: ctx.tenantId, itemId: line.source.itemId, warehouseId: line.source.warehouseId, batchId: line.source.batchId, movementType: "SUPPLIER_RETURN", quantity: decimal(-line.quantity), referenceType: "RETURN", referenceId: record.id, operationId: crypto.randomUUID(), createdBy: ctx.userId });
     }
-    const payable = await tx.query.payables.findFirst({ where: and(eq(payables.tenantId, ctx.tenantId), eq(payables.purchaseId, purchase.id)) });
     if (payable) {
-      const nextAmount = units(payable.amount) - total;
-      const nextBalance = units(payable.balance) - total;
-      await tx.update(payables).set({ amount: decimal(nextAmount > 0n ? nextAmount : 0n), balance: decimal(nextBalance > 0n ? nextBalance : 0n), status: nextBalance <= 0n ? "SETTLED" : payable.status, updatedAt: new Date() }).where(eq(payables.id, payable.id));
+      const nextBalance = availablePayable - payableReduction;
+      await tx.update(payables).set({
+        amount: decimal(units(payable.paidAmount) + nextBalance),
+        balance: decimal(nextBalance),
+        status: nextBalance === 0n ? "SETTLED" : "PARTIAL",
+        updatedAt: new Date(),
+      }).where(and(eq(payables.id, payable.id), eq(payables.tenantId, ctx.tenantId)));
     }
 
     await postSupplierReturnJournal(tx, ctx, {
       returnId: record.id,
       operationId,
       returnedCostTotal: decimal(total),
-      // No payable found => the purchase was already fully paid, so
-      // this return settles as cash received back from the supplier
-      // rather than a reduction of an outstanding balance (mirrors
-      // the customer-return simplification, see accounting.ts).
-      refundedInCash: !payable,
+      supplierRefundAmount: decimal(supplierRefund),
+      payableReductionAmount: decimal(payableReduction),
     });
 
     await recordAudit(tx, ctx, {

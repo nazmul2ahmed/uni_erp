@@ -14,6 +14,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import {
+  accounts,
   auditLogs,
   businessProfiles,
   customers,
@@ -191,5 +192,72 @@ describe("Return condition — UNSELLABLE (Decision VAN-003, new)", () => {
     const balance = await withTenantTransaction(tenantId, (tx) => tx.query.stockBalances.findFirst({ where: (b, { eq: e, and: a }) => a(e(b.itemId, item.id), e(b.warehouseId, warehouseId)) }));
     // 10 - 4 sold + 1 good return = 7 (the unsellable return nets to zero)
     expect(balance?.quantityOnHand).toBe("7.0000");
+  });
+});
+
+describe("Customer return settlement — original paid/due ratio (08 §5.5)", () => {
+  it("splits partial refunds cumulatively and assigns rounding remainders", async () => {
+    const item = await newStockedItem("5");
+    const sale = await completeSale(
+      ownerCtx,
+      {
+        customerId,
+        branchId,
+        lines: [{ itemId: item.id, quantity: "3", unitPrice: item.sellingPrice, warehouseId, lineDiscount: "0" }],
+        orderDiscount: "0",
+        cashReceived: "500",
+      } as never,
+      randomUUID(),
+    );
+    const saleLine = await withTenantTransaction(tenantId, (tx) =>
+      tx.query.saleItems.findFirst({ where: (line, { eq: equals }) => equals(line.saleId, sale.id) }),
+    );
+    if (!saleLine) throw new Error("Expected a sale line for proportional-return test");
+
+    const returnRows: Array<Awaited<ReturnType<typeof completeCustomerReturn>>> = [];
+    for (let index = 0; index < 3; index += 1) {
+      returnRows.push(await completeCustomerReturn(
+        ownerCtx,
+        { saleId: sale.id, warehouseId, lines: [{ sourceLineId: saleLine.id, quantity: "1" }] } as never,
+        randomUUID(),
+      ));
+    }
+
+    const [receivable, journalLines] = await Promise.all([
+      withTenantTransaction(tenantId, (tx) =>
+        tx.query.receivables.findFirst({ where: (row, { eq: equals }) => equals(row.saleId, sale.id) }),
+      ),
+      withTenantTransaction(tenantId, (tx) =>
+        tx.select({
+          referenceId: journals.referenceId,
+          code: accounts.code,
+          debit: journalEntries.debit,
+          credit: journalEntries.credit,
+        })
+          .from(journalEntries)
+          .innerJoin(journals, eq(journals.id, journalEntries.journalId))
+          .innerJoin(accounts, eq(accounts.id, journalEntries.accountId))
+          .where(and(
+            eq(journals.tenantId, tenantId),
+            eq(journals.referenceType, "RETURN"),
+            eq(journals.description, "Customer return -- revenue reversal"),
+          )),
+      ),
+    ]);
+
+    expect(returnRows.map((row) => row.cashRefundAmount)).toEqual(["166.6667", "166.6666", "166.6667"]);
+    expect(returnRows.map((row) => row.receivableReductionAmount)).toEqual(["333.3333", "333.3334", "333.3333"]);
+    expect(receivable).toMatchObject({ amount: "500.0000", paidAmount: "500.0000", balance: "0.0000", status: "SETTLED" });
+
+    const testJournalLines = journalLines.filter((line) => returnRows.some((row) => row.id === line.referenceId));
+    expect(testJournalLines.filter((line) => line.code === "1000").map((line) => line.credit))
+      .toEqual(["166.6667", "166.6666", "166.6667"]);
+    expect(testJournalLines.filter((line) => line.code === "1100").map((line) => line.credit))
+      .toEqual(["333.3333", "333.3334", "333.3333"]);
+    for (const row of returnRows) {
+      const lines = testJournalLines.filter((line) => line.referenceId === row.id);
+      expect(lines.reduce((sum, line) => sum + Number(line.debit), 0))
+        .toBeCloseTo(lines.reduce((sum, line) => sum + Number(line.credit), 0), 4);
+    }
   });
 });

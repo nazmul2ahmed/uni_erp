@@ -201,12 +201,14 @@ current prices or tax profiles. Partial returns allocate remaining amounts
 proportionally to remaining quantity; the last return receives any rounding
 remainder.
 
-Proportional allocation between Receivable-reduction vs Cash-refund follows
-the originating sale's paid/due ratio at the time of sale, unless the tenant
-configures return refunds as always-cash (a tenant setting, per §44 `02`
-distinction between rule and configuration). The current MVP still uses the
-existing all-cash-or-all-receivable settlement choice; the ratio/configuration
-policy remains open.
+Customer return settlement follows the originating sale's paid/due ratio at
+sale completion. Across partial returns, the cumulative cash-refund target is
+rounded to four decimal places and each return receives the difference from
+the amounts already refunded; the final return therefore absorbs any rounding
+remainder. The receivable reduction is capped at the currently outstanding
+balance, and any excess is refunded in cash. Phase 2 uses this proportional
+policy as its default; an always-cash tenant override is not part of the
+Phase 2 scope.
 
 ## 5.6 Supplier Return
 
@@ -219,6 +221,11 @@ For the current MVP, purchase tax is capitalized into Inventory (§5.2), so
 supplier returns reverse the original net-of-discount inventory cost plus
 its snapshotted purchase tax; both the liability/cash settlement and
 Inventory credit use that returned grand total.
+
+Supplier return settlement mirrors the customer policy above using the
+originating purchase's paid/due ratio. Partial returns use cumulative
+four-decimal rounding, cap the payable reduction at its outstanding balance,
+and refund any excess in cash/bank.
 
 ## 5.7 Expense Recorded (`RecordExpenseUseCase`, `07` §14.2)
 

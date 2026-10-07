@@ -5,7 +5,7 @@ this file for each completed milestone, code/documentation change, decision,
 validation result, and blocker. The governing phase advances only after its
 documented exit criteria have evidence.
 
-## Current position — 2026-10-06
+## Current position — 2026-10-07
 
 **Development direction:** Continue roadmap implementation locally; defer
 external staging work until deployment/release readiness.
@@ -14,13 +14,10 @@ external staging work until deployment/release readiness.
 The local Phase 1 code/test criteria have evidence, but isolated staging remains
 open; this user-approved sequencing decision does not waive that criterion.
 
-**Active development milestone:** Phase 2 — Core Commerce acceptance and gap
-closure. Tax-exclusive profiles/calculation and customer/supplier return
-discount/tax reversals are implemented and locally verified. Sale cancellation
-now follows the user's policy: refund amounts paid toward the sale and reverse
-the remaining due. Phase 2 remains open while the remaining financial-matrix
-rows are reviewed. Staging remains a release gate, not a code-development
-blocker.
+**Completed development milestone:** Phase 2 — Core Commerce. Its roadmap exit
+criteria are locally verified and recorded below. Per the user's direction,
+Phase 1 staging/release work remains deferred and does not block code-first
+progression to Phase 3.
 
 The repository contains substantial work beyond the current governed phase,
 including Core Commerce and platform-operator surfaces. Their presence does
@@ -47,32 +44,77 @@ current Phase 1 evidence covers shared-mode database isolation and real
 customer/supplier/item use-case paths only.
 
 ### Current verification
-
-- `pnpm -r test` — passed on 2026-10-06 (40 web test files, 450 tests; 1
-  database RLS test). The final full-suite run was performed separately from
-  E2E/typecheck to avoid resource contention.
-- `pnpm -r typecheck` — passed on 2026-10-06.
-- `pnpm -r lint` — passed on 2026-10-06.
-- `pnpm --filter web exec playwright test e2e/phase2-commerce.spec.ts` —
-  passed on 2026-10-06 against the production server (2 browser tests):
-  Purchase → Stock → POS Sale → later Payment → P&L, plus tax profile
-  setup/assignment and tax-exclusive purchase/sale totals. Test-created
-  fixtures are cleaned up.
-- `pnpm build` — passed on 2026-10-06.
+- `pnpm -r test` — passed on 2026-10-07 (41 web test files, 461 tests; 1
+  database RLS test).
+- Focused Phase 2 regressions — 27 tests passed across FIFO/stock concurrency,
+  weighted-average cost, taxes, customer/supplier settlement, returns, and
+  sale cancellation.
+- `pnpm -r typecheck` and `pnpm -r lint` — passed on 2026-10-07.
+- `pnpm --filter web exec playwright test e2e/phase2-commerce.spec.ts
+  --reporter=line` — passed on 2026-10-07 (2 browser tests), including
+  Purchase → Stock → POS Sale → later Payment → Customer Due → Basic P&L,
+  cancellation through the UI, and tax-profile/pricing setup. Test fixtures
+  are cleaned up.
+- `pnpm build` — passed on 2026-10-07. Next.js logged its dynamic-route notices
+  while evaluating authenticated API routes; static generation and build
+  completed successfully.
+- `pnpm db:migrate` — passed locally; customer and supplier return settlement
+  columns are present in local PostgreSQL.
 - Local PostgreSQL and Redis Compose services were running during this check.
 - No production or staging environment or backup restore was verified.
 
+### Phase 2 exit evidence
+
+| Phase 2 exit criterion (`Plan/28` §4) | Evidence | Status |
+|---|---|---|
+| Phase 2-owned financial-matrix rows pass | Real-Postgres tests cover sale/purchase payment allocation and advances, balanced tax/discount postings, proportional customer/supplier return settlement with rounding, return quantity boundaries, cancellation and exact reversal, idempotency, and P&L; see `apps/web/test/tax.integration.test.ts`, `return-condition.integration.test.ts`, `sale-cancellation.integration.test.ts`, `expense.integration.test.ts`, and `profit-loss.integration.test.ts` | Verified locally |
+| FIFO inventory matrix passes for Phase 2 scope | Purchase/batch creation, FIFO consumption, batch-specific COGS, weighted-average recalculation, aggregate duplicate-line rejection, concurrent last-unit sale, and atomic return behavior pass against local PostgreSQL; see `field-sale.integration.test.ts`, `tax.integration.test.ts`, and `return-condition.integration.test.ts` | Verified locally |
+| Commerce workflow works entirely through the UI | Playwright completed Purchase → Stock → POS Sale → later Payment → settled Customer Due → Basic P&L, then sale cancellation; see `apps/web/e2e/phase2-commerce.spec.ts` | Verified locally |
+| Returns reverse historical discounts/tax and preserve partial rounding; paid-sale cancellation is decided and tested | Customer and supplier settlement use the originating paid/due ratio and cumulative four-place rounding; cancellation refunds allocated amounts and reverses remaining due, with integration and browser coverage | Verified locally |
+
+The remaining full-platform inventory rows (FEFO, serial selection,
+reservations, transfers, offline-origin conflicts, stock-count workflow, and
+background reconciliation) are explicitly outside the Phase 2 FIFO baseline
+and remain assigned to their roadmap-owning phases. Opening entries, period
+close, and manual journal adjustments remain Phase 3 work. Phase 1 staging is
+still a separate release gate.
+
 ### Immediate next work, in roadmap order
 
-1. Review and record evidence for the remaining Phase 2 financial-matrix rows.
+1. Continue with Phase 3 — Accounting Depth under `Plan/28` §4.
 2. Keep isolated staging (`Plan/25` §§2–3) deferred as non-code deployment
-   work. It remains a release gate: do not describe Phase 1 as formally exited
-   until staging and all other required criteria are verified.
+   work. Do not describe Phase 1 as formally exited until staging and all
+   other required criteria are verified.
 3. When staging becomes available, record deployment, environment isolation,
    health-check, and migration evidence here; then re-evaluate release
    readiness.
 
 ## Work log
+
+### 2026-10-07 — Phase 2 Core Commerce exit
+
+- Completed the Phase 2 financial-matrix review and documented its boundary
+  against Phase 3 in `Plan/28`; FEFO, serial allocation, reservations, transfer,
+  offline conflicts, stock counts, and ledger reconciliation remain in their
+  roadmap-owning phases.
+- Implemented and tested cumulative paid/due-ratio settlement for both customer
+  and supplier returns. Outstanding receivable/payable reductions are capped
+  at the live balance; the residual is refunded, and partial-return rounding
+  is assigned cumulatively at four decimal places. Updated `Plan/08` to record
+  this Phase 2 policy.
+- Added return settlement snapshot columns and migration
+  `packages/db/migrations/0016_pretty_wiccan.sql` / `0017_parched_klaw.sql`.
+  Supplier payments and supplier returns now lock purchase/payable rows in
+  stable order, preventing concurrent payment/return over-allocation.
+- Added real-Postgres coverage for cumulative customer refund/receivable
+  rounding, supplier cash/payable splits, customer/supplier payment allocation
+  and advances, FIFO and batch costing, purchase weighted-average cost,
+  concurrent last-unit sale, return over-boundary rejection, and cancellation.
+- Validation on 2026-10-07: `pnpm -r test` passed (41 web test files, 461
+  tests; 1 database RLS test); focused Phase 2 regressions passed (27 tests);
+  workspace typecheck, lint, production build, migration, and the two Phase 2
+  browser acceptance tests passed. Phase 1 staging remains deferred and is not
+  claimed as passed.
 
 ### 2026-10-06 — Baseline and execution tracking
 

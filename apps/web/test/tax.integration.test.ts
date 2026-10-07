@@ -8,8 +8,11 @@ import {
   journalEntries,
   journals,
   memberships,
+  payables,
+  payments,
   purchaseItems,
   purchases,
+  receivables,
   returnLines,
   returns,
   saleItems,
@@ -33,6 +36,7 @@ import { createSupplier } from "../lib/use-cases/supplier";
 import { createCustomer } from "../lib/use-cases/customer";
 import { createTaxProfile } from "../lib/use-cases/tax-profile";
 import { completeCustomerReturn, completeSupplierReturn } from "../lib/use-cases/returns";
+import { recordCustomerPayment, recordSupplierPayment } from "../lib/use-cases/finance";
 import { decimalToUnits } from "../lib/money";
 import type { TenantContext } from "../lib/guard";
 
@@ -259,6 +263,28 @@ describe("tenant tax profile posting", () => {
     expect(state.fifoCogs.reduce((sum, row) => sum + Number(row.debit), 0)).toBe(156.75);
   });
 
+  it("recalculates weighted-average cost for each purchase movement", async () => {
+    const purchase = await receivePurchase(ctx, createPurchaseSchema.parse({
+      supplierId,
+      branchId,
+      lines: [{
+        itemId,
+        quantity: "1",
+        costPrice: "200",
+        lineDiscount: "0",
+        warehouseId,
+      }],
+      orderDiscount: "0",
+      cashPaid: "0",
+    }), crypto.randomUUID());
+    const balance = await withTenantTransaction(tenantId, (tx) => tx.query.stockBalances.findFirst({
+      where: and(eq(stockBalances.tenantId, tenantId), eq(stockBalances.itemId, itemId), eq(stockBalances.warehouseId, warehouseId)),
+    }));
+
+    expect(purchase.grandTotal).toBe("220.0000");
+    expect(balance).toMatchObject({ quantityOnHand: "2.0000", weightedAvgCost: "162.2500" });
+  });
+
   it("reverses customer return tax and discounts across partial returns", async () => {
     const source = await withTenantTransaction(tenantId, (tx) => tx.query.saleItems.findFirst({
       where: and(eq(saleItems.saleId, fifoSaleId), eq(saleItems.quantity, "0.5000")),
@@ -276,6 +302,11 @@ describe("tenant tax profile posting", () => {
       warehouseId,
       lines: [{ sourceLineId: source.id, quantity: "0.25" }],
     }, crypto.randomUUID());
+    await expect(completeCustomerReturn(ctx, {
+      saleId: fifoSaleId,
+      warehouseId,
+      lines: [{ sourceLineId: source.id, quantity: "0.0001" }],
+    }, crypto.randomUUID())).rejects.toMatchObject({ code: "RETURN_QTY_EXCEEDED" });
 
     const result = await withTenantTransaction(tenantId, async (tx) => {
       const sourceNetUnits = decimalToUnits(source.lineTotal)
@@ -339,5 +370,183 @@ describe("tenant tax profile posting", () => {
       where: eq(returnLines.returnId, result.id),
     }));
     expect(line).toMatchObject({ lineTotal: "104.5000", taxAmount: "9.5000" });
+  });
+
+  it("splits supplier refunds and payable reductions by the original purchase settlement ratio", async () => {
+    const purchase = await receivePurchase(ctx, createPurchaseSchema.parse({
+      supplierId,
+      branchId,
+      lines: [{
+        itemId,
+        quantity: "3",
+        costPrice: "100",
+        lineDiscount: "0",
+        warehouseId,
+      }],
+      orderDiscount: "0",
+      cashPaid: "165",
+    }), crypto.randomUUID());
+    const source = await withTenantTransaction(tenantId, (tx) => tx.query.purchaseItems.findFirst({
+      where: eq(purchaseItems.purchaseId, purchase.id),
+    }));
+    if (!source) throw new Error("Expected a source line for the partially paid purchase");
+
+    const result = await completeSupplierReturn(ctx, {
+      purchaseId: purchase.id,
+      warehouseId,
+      lines: [{ sourceLineId: source.id, quantity: "1" }],
+    }, crypto.randomUUID());
+    const [payable, journalLines] = await Promise.all([
+      withTenantTransaction(tenantId, (tx) => tx.query.payables.findFirst({
+        where: eq(payables.purchaseId, purchase.id),
+      })),
+      withTenantTransaction(tenantId, (tx) => tx.select({
+        code: accounts.code,
+        debit: journalEntries.debit,
+        credit: journalEntries.credit,
+      }).from(journalEntries)
+        .innerJoin(journals, eq(journals.id, journalEntries.journalId))
+        .innerJoin(accounts, eq(accounts.id, journalEntries.accountId))
+        .where(and(eq(journals.tenantId, tenantId), eq(journals.referenceId, result.id))),
+      ),
+    ]);
+
+    expect(result).toMatchObject({
+      grandTotal: "110.0000",
+      supplierRefundAmount: "55.0000",
+      payableReductionAmount: "55.0000",
+    });
+    expect(payable).toMatchObject({ amount: "275.0000", paidAmount: "165.0000", balance: "110.0000", status: "PARTIAL" });
+    expect(journalLines).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "1010", debit: "55.0000", credit: "0.0000" }),
+      expect.objectContaining({ code: "2000", debit: "55.0000", credit: "0.0000" }),
+      expect.objectContaining({ code: "1200", debit: "0.0000", credit: "110.0000" }),
+    ]));
+    expect(sumMoney(journalLines.map((line) => line.debit)))
+      .toBe(sumMoney(journalLines.map((line) => line.credit)));
+  });
+
+  it("allocates customer and supplier payments, retains advances, and replays by operationId", async () => {
+    const purchase = await receivePurchase(ctx, createPurchaseSchema.parse({
+      supplierId,
+      branchId,
+      lines: [{
+        itemId,
+        quantity: "2",
+        costPrice: "100",
+        lineDiscount: "0",
+        warehouseId,
+      }],
+      orderDiscount: "0",
+      cashPaid: "100",
+    }), crypto.randomUUID());
+    const supplierKey = crypto.randomUUID();
+    const supplierPayment = await recordSupplierPayment(ctx, {
+      supplierId,
+      amount: "100",
+      method: "BANK",
+      allocations: [{ purchaseId: purchase.id, amount: "80" }],
+    }, supplierKey);
+    await expect(recordSupplierPayment(ctx, {
+      supplierId,
+      amount: "100",
+      method: "BANK",
+      allocations: [{ purchaseId: purchase.id, amount: "80" }],
+    }, supplierKey)).resolves.toMatchObject({ id: supplierPayment.id });
+    const [payableAfterPartial, paymentRows] = await Promise.all([
+      withTenantTransaction(tenantId, (tx) => tx.query.payables.findFirst({ where: eq(payables.purchaseId, purchase.id) })),
+      withTenantTransaction(tenantId, (tx) => tx.query.payments.findMany({
+        where: and(eq(payments.tenantId, tenantId), eq(payments.operationId, supplierKey)),
+      })),
+    ]);
+    expect(payableAfterPartial).toMatchObject({ paidAmount: "180.0000", balance: "40.0000", status: "PARTIAL" });
+    expect(paymentRows).toHaveLength(1);
+
+    await recordSupplierPayment(ctx, {
+      supplierId,
+      amount: "50",
+      method: "BANK",
+      allocations: [{ purchaseId: purchase.id, amount: "40" }],
+    }, crypto.randomUUID());
+    const payableAfterFull = await withTenantTransaction(tenantId, (tx) =>
+      tx.query.payables.findFirst({ where: eq(payables.purchaseId, purchase.id) }),
+    );
+    expect(payableAfterFull).toMatchObject({ paidAmount: "220.0000", balance: "0.0000", status: "SETTLED" });
+
+    const concurrentPurchase = await receivePurchase(ctx, createPurchaseSchema.parse({
+      supplierId,
+      branchId,
+      lines: [{
+        itemId,
+        quantity: "2",
+        costPrice: "100",
+        lineDiscount: "0",
+        warehouseId,
+      }],
+      orderDiscount: "0",
+      cashPaid: "0",
+    }), crypto.randomUUID());
+    const concurrentPayments = await Promise.allSettled([
+      recordSupplierPayment(ctx, {
+        supplierId,
+        amount: "150",
+        method: "BANK",
+        allocations: [{ purchaseId: concurrentPurchase.id, amount: "150" }],
+      }, crypto.randomUUID()),
+      recordSupplierPayment(ctx, {
+        supplierId,
+        amount: "150",
+        method: "BANK",
+        allocations: [{ purchaseId: concurrentPurchase.id, amount: "150" }],
+      }, crypto.randomUUID()),
+    ]);
+    expect(concurrentPayments.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejectedPayment = concurrentPayments.find((attempt): attempt is PromiseRejectedResult => attempt.status === "rejected");
+    expect(rejectedPayment?.reason).toMatchObject({ code: "VALIDATION_FAILED" });
+    const payableAfterConcurrentPayments = await withTenantTransaction(tenantId, (tx) =>
+      tx.query.payables.findFirst({ where: eq(payables.purchaseId, concurrentPurchase.id) }),
+    );
+    expect(payableAfterConcurrentPayments).toMatchObject({ paidAmount: "150.0000", balance: "70.0000", status: "PARTIAL" });
+
+    const sale = await completeSale(ctx, createSaleSchema.parse({
+      customerId,
+      branchId,
+      lines: [{
+        itemId,
+        quantity: "1",
+        unitPrice: sellingPrice,
+        lineDiscount: "0",
+        warehouseId,
+      }],
+      orderDiscount: "0",
+      cashReceived: "50",
+    }), crypto.randomUUID());
+    const customerPayment = await recordCustomerPayment(ctx, {
+      customerId,
+      amount: "220",
+      method: "CASH",
+      allocations: [{ saleId: sale.id, amount: "170" }],
+    }, crypto.randomUUID());
+    const [receivable, settledSale, customerJournal] = await Promise.all([
+      withTenantTransaction(tenantId, (tx) => tx.query.receivables.findFirst({ where: eq(receivables.saleId, sale.id) })),
+      withTenantTransaction(tenantId, (tx) => tx.query.sales.findFirst({ where: eq(sales.id, sale.id) })),
+      withTenantTransaction(tenantId, (tx) => tx.select({
+        code: accounts.code,
+        debit: journalEntries.debit,
+        credit: journalEntries.credit,
+      }).from(journalEntries)
+        .innerJoin(journals, eq(journals.id, journalEntries.journalId))
+        .innerJoin(accounts, eq(accounts.id, journalEntries.accountId))
+        .where(and(eq(journals.tenantId, tenantId), eq(journals.referenceId, customerPayment.id))),
+      ),
+    ]);
+    expect(receivable).toMatchObject({ paidAmount: "220.0000", balance: "0.0000", status: "SETTLED" });
+    expect(settledSale).toMatchObject({ paidTotal: "220.0000", dueTotal: "0.0000", status: "PAID" });
+    expect(customerJournal).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "1100", debit: "0.0000", credit: "170.0000" }),
+      expect.objectContaining({ code: "2300", debit: "0.0000", credit: "50.0000" }),
+    ]));
+    expect(sumMoney(customerJournal.map((line) => line.debit)))
+      .toBe(sumMoney(customerJournal.map((line) => line.credit)));
   });
 });

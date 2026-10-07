@@ -105,6 +105,39 @@ async function recordPayment(
         byTarget.set(allocation.id, target);
       }
     }
+    if (partyType === "SUPPLIER" && allocations.length > 0) {
+      const targetIds = [...new Set(allocations.map((allocation) => allocation.id))].sort();
+      const lockedPurchases = await tx.select({ id: purchases.id })
+        .from(purchases)
+        .where(and(eq(purchases.tenantId, ctx.tenantId), inArray(purchases.id, targetIds)))
+        .orderBy(asc(purchases.id))
+        .for("update");
+      if (lockedPurchases.length !== targetIds.length) {
+        throw new AppError("RESOURCE_NOT_FOUND", "Payment allocation target not found");
+      }
+      const lockedPayables = await tx.select().from(payables)
+        .where(and(
+          eq(payables.tenantId, ctx.tenantId),
+          eq(payables.supplierId, partyId),
+          inArray(payables.purchaseId, targetIds),
+        ))
+        .orderBy(asc(payables.purchaseId))
+        .for("update");
+      const payableByPurchase = new Map(lockedPayables.map((row) => [row.purchaseId, row]));
+      const requestedByPurchase = new Map<string, bigint>();
+      for (const allocation of allocations) {
+        const target = payableByPurchase.get(allocation.id);
+        if (!target || !["OPEN", "PARTIAL"].includes(target.status)) {
+          throw new AppError("RESOURCE_NOT_FOUND", "Payment allocation target not found or already settled");
+        }
+        const requested = (requestedByPurchase.get(allocation.id) ?? 0n) + moneyUnits(allocation.amount);
+        if (requested > moneyUnits(target.balance)) {
+          throw new AppError("VALIDATION_FAILED", "Payment allocation exceeds the outstanding balance");
+        }
+        requestedByPurchase.set(allocation.id, requested);
+        byTarget.set(allocation.id, target);
+      }
+    }
 
     const [payment] = await tx.insert(payments).values({
       tenantId: ctx.tenantId,

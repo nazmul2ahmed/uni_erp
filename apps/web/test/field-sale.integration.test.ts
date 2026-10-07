@@ -7,7 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import {
   accounts, businessProfiles, db, items, journalEntries, journals, memberships, paymentAllocations, payments,
   receivables, repCustodyBalances, repStockAssignmentLines, repStockAssignments, repStockMovements, roles,
@@ -206,6 +206,26 @@ describe("field sale — NO double deduction (Decision VAN-012)", () => {
     expect(persistedSale).toBeUndefined();
     const saleMovements = await withTenantTransaction(tenantId, (tx) => tx.query.stockMovements.findMany({ where: (movement, { eq: equals, and: both }) => both(equals(movement.itemId, item.id), equals(movement.movementType, "SALE")) }));
     expect(saleMovements).toHaveLength(0);
+  });
+
+  it("allows exactly one concurrent sale against the last unit", async () => {
+    const item = await stockedItem("1");
+    const operationIds = [randomUUID(), randomUUID()];
+    const attempts = await Promise.allSettled([
+      completeSale(ownerCtx, saleBody(item, "1"), operationIds[0]!),
+      completeSale(ownerCtx, saleBody(item, "1"), operationIds[1]!),
+    ]);
+
+    expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+    const rejected = attempts.find((attempt): attempt is PromiseRejectedResult => attempt.status === "rejected");
+    expect(rejected?.reason).toMatchObject({ code: "INSUFFICIENT_STOCK" });
+    expect(await onHand(item.id)).toBe("0.0000");
+    const [persistedSales, saleMovements] = await withTenantTransaction(tenantId, async (tx) => Promise.all([
+      tx.query.sales.findMany({ where: (sale, { and: both, eq: equals, inArray: oneOf }) => both(equals(sale.tenantId, tenantId), oneOf(sale.operationId, operationIds)) }),
+      tx.query.stockMovements.findMany({ where: (movement, { eq: equals, and: both }) => both(equals(movement.itemId, item.id), equals(movement.movementType, "SALE")) }),
+    ]));
+    expect(persistedSales).toHaveLength(1);
+    expect(saleMovements).toHaveLength(1);
   });
 });
 

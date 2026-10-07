@@ -400,17 +400,7 @@ export async function postSupplierPaymentJournal(
   });
 }
 
-/**
- * Customer Return -- 08 §5.5. `refundedInCash` distinguishes the
- * receivable-reduction case (sale was on due -- Cr Accounts
- * Receivable) from the cash-refund case (sale was already fully paid
- * -- Cr Cash), per §5.5's "Proportional allocation ... follows the
- * originating sale's paid/due ratio" note -- this codebase's return
- * use case currently reduces the receivable when one exists and does
- * the cash case only when none does (an all-or-nothing simplification
- * of the proportional split 08 §5.5 describes; retained as a known
- * settlement-policy gap).
- */
+/** Customer Return -- 08 §5.5. */
 export async function postCustomerReturnJournal(
   tx: Database,
   ctx: TenantContext,
@@ -421,7 +411,8 @@ export async function postCustomerReturnJournal(
     returnedTax: string;
     returnedGrandTotal: string;
     returnedCostTotal: string;
-    refundedInCash: boolean;
+    cashRefundAmount: string;
+    receivableReductionAmount: string;
     /**
      * Decision VAN-003 (30_MODULE_VAN_SALES.md §5.2) — the portion of
      * returnedCostTotal that is physically UNSELLABLE (damaged/expired
@@ -436,7 +427,9 @@ export async function postCustomerReturnJournal(
     unsellableCostTotal?: string;
   },
 ) {
-  const settlementCode = params.refundedInCash ? "1000" : "1100";
+  const settlementLines: JournalLine[] = [];
+  if (toUnits(params.cashRefundAmount) > 0n) settlementLines.push({ code: "1000", credit: params.cashRefundAmount });
+  if (toUnits(params.receivableReductionAmount) > 0n) settlementLines.push({ code: "1100", credit: params.receivableReductionAmount });
   const revenueJournal = await postJournal(tx, ctx, {
     referenceType: "RETURN",
     referenceId: params.returnId,
@@ -445,7 +438,7 @@ export async function postCustomerReturnJournal(
     lines: [
       { code: "4000", debit: params.returnedSubtotal },
       ...(toUnits(params.returnedTax) > 0n ? [{ code: "2100", debit: params.returnedTax }] : []),
-      { code: settlementCode, credit: params.returnedGrandTotal },
+      ...settlementLines,
     ],
   });
 
@@ -548,20 +541,28 @@ export async function postCustodyWriteOffJournal(
   });
 }
 
-/** Supplier Return -- 08 §5.6. Mirrors the customer-return settlement logic (payable reduction vs. cash received back). */
+/** Supplier Return -- 08 §5.6. */
 export async function postSupplierReturnJournal(
   tx: Database,
   ctx: TenantContext,
-  params: { returnId: string; operationId: string; returnedCostTotal: string; refundedInCash: boolean },
+  params: {
+    returnId: string;
+    operationId: string;
+    returnedCostTotal: string;
+    supplierRefundAmount: string;
+    payableReductionAmount: string;
+  },
 ) {
-  const settlementCode = params.refundedInCash ? "1000" : "2000";
+  const settlementLines: JournalLine[] = [];
+  if (toUnits(params.supplierRefundAmount) > 0n) settlementLines.push({ code: "1010", debit: params.supplierRefundAmount });
+  if (toUnits(params.payableReductionAmount) > 0n) settlementLines.push({ code: "2000", debit: params.payableReductionAmount });
   return postJournal(tx, ctx, {
     referenceType: "RETURN",
     referenceId: params.returnId,
     operationId: params.operationId,
     description: "Supplier return",
     lines: [
-      { code: settlementCode, debit: params.returnedCostTotal },
+      ...settlementLines,
       { code: "1200", credit: params.returnedCostTotal },
     ],
   });
